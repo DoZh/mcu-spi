@@ -1,8 +1,10 @@
 
 #include <linux/module.h>
 #include <linux/fs.h>
+#include <linux/platform_device.h>
 #include <linux/device.h>
 #include <linux/cdev.h>
+#include <linux/of_device.h>
 
 #define  DEVICE_NAME "mydev"
 #define  CLASS_NAME  "hello_class"
@@ -37,7 +39,7 @@ static const struct file_operations my_dev_fops = {
 	.unlocked_ioctl 	= my_dev_ioctl,
 };
 
-static int __init hello_init(void)
+static int my_probe(struct platform_device *pdev)
 {
 	int ret;
 	dev_t dev_no;
@@ -61,8 +63,8 @@ static int __init hello_init(void)
 	pr_info("Allocated correctly with major number %d\n", Major);
 
 	/* Initialize the cdev structure and add it to the kernel space */
-	cdev_init(&my_dev, &my_dev_fops);
-	ret = cdev_add(&my_dev, dev, 1);
+	cdev_init(&my_dev, &my_dev_fops); // init
+	ret = cdev_add(&my_dev, dev, 1); // add kernel device by dev id
 	if (ret < 0){
 		unregister_chrdev_region(dev, 1);
 		pr_info("Unable to add cdev\n");
@@ -70,7 +72,7 @@ static int __init hello_init(void)
 	}
 
 	/* Register the device class */
-	helloClass = class_create(THIS_MODULE, CLASS_NAME);
+	helloClass = class_create(THIS_MODULE, CLASS_NAME); // make /sys/class/hello_class
 	if (IS_ERR(helloClass)){
 		unregister_chrdev_region(dev, 1);
 		cdev_del(&my_dev);
@@ -80,7 +82,7 @@ static int __init hello_init(void)
 	pr_info("device class registered correctly\n");
 
 	/* Create a device node named DEVICE_NAME associated a dev */
-	helloDevice = device_create(helloClass, NULL, dev, NULL, DEVICE_NAME);
+	helloDevice = device_create(helloClass, NULL, dev, NULL, DEVICE_NAME); // make /sys/class/hello_class/mydev & /dev/mydev
 	if (IS_ERR(helloDevice)){
 	    class_destroy(helloClass);
 	    cdev_del(&my_dev);
@@ -93,7 +95,7 @@ static int __init hello_init(void)
 	return 0;
 }
 
-static void __exit hello_exit(void)
+static int my_remove(struct platform_device *pdev)
 {
 
 	device_destroy(helloClass, dev);     /* remove the device */
@@ -101,11 +103,36 @@ static void __exit hello_exit(void)
 	cdev_del(&my_dev);
 	unregister_chrdev_region(dev, 1);    /* unregister the device numbers */
 	pr_info("Hello world with parameter exit\n");
+	return 0;
 }
 
-module_init(hello_init);
-module_exit(hello_exit);
+/* Declare a list of devices supported by the driver */
+static const struct of_device_id my_of_ids[] = {
+	{ .compatible = "dozh,hello"},
+	{},
+};
+MODULE_DEVICE_TABLE(of, my_of_ids);
 
+/* 
+To device tree file
+        helloworld {
+                compatible = "dozh,hello";
+        };
+*/
+
+/* Define platform driver structure */
+static struct platform_driver my_platform_driver = {
+	.probe = my_probe,
+	.remove = my_remove,
+	.driver = {
+		.name = "helloworld",
+		.of_match_table = my_of_ids,
+		.owner = THIS_MODULE,
+	}
+};
+
+/* Register our platform driver */
+module_platform_driver(my_platform_driver); // make /sys/bus/platform/drivers/helloworld
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("DoZh <TATQAQTAT@gmail.com>");
