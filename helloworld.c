@@ -11,6 +11,8 @@
 
 static struct class*  helloClass;
 static struct cdev my_dev;
+
+int major_no;
 dev_t dev;
 
 static int my_dev_open(struct inode *inode, struct file *file)
@@ -42,28 +44,17 @@ static const struct file_operations my_dev_fops = {
 static int my_probe(struct platform_device *pdev)
 {
 	int ret;
-	dev_t dev_no;
-	int Major;
 
 	struct device* helloDevice;
 
-	pr_info("Hello world init\n");
-
-	/* Allocate dynamically device numbers */
-	ret = alloc_chrdev_region(&dev_no, 0, 1, DEVICE_NAME);
-	if (ret < 0){
-		pr_info("Unable to allocate Mayor number \n");
-		return ret;
-	}
+	pr_info("Hello world probe\n");
 
 	/* Get the device identifiers */
-	Major = MAJOR(dev_no);
-	dev = MKDEV(Major,0);
+	dev = MKDEV(major_no,0);
 
-	pr_info("Allocated correctly with major number %d\n", Major);
 
 	/* Initialize the cdev structure and add it to the kernel space */
-	cdev_init(&my_dev, &my_dev_fops); // init
+	cdev_init(&my_dev, &my_dev_fops); // init cdev struct my_dev
 	ret = cdev_add(&my_dev, dev, 1); // add kernel device by dev id
 	if (ret < 0){
 		unregister_chrdev_region(dev, 1);
@@ -102,7 +93,7 @@ static int my_remove(struct platform_device *pdev)
 	class_destroy(helloClass);           /* remove the device class */
 	cdev_del(&my_dev);
 	unregister_chrdev_region(dev, 1);    /* unregister the device numbers */
-	pr_info("Hello world with parameter exit\n");
+	pr_info("Hello world remove\n");
 	return 0;
 }
 
@@ -131,8 +122,44 @@ static struct platform_driver my_platform_driver = {
 	}
 };
 
-/* Register our platform driver */
-module_platform_driver(my_platform_driver); // make /sys/bus/platform/drivers/helloworld
+static int __init hello_init(void)
+{
+	dev_t dev_no;
+	int ret_val;
+
+	pr_info("Hello world init\n");
+		/* Allocate dynamically device numbers */
+	ret_val = alloc_chrdev_region(&dev_no, 0, 1, DEVICE_NAME);
+	if (ret_val < 0){
+		pr_info("Unable to allocate Mayor number \n");
+		return ret_val;
+	}
+
+	/* Get the major device identifiers */
+	major_no = MAJOR(dev_no);
+
+
+	pr_info("Allocated correctly with major number %d\n", major_no);
+
+	ret_val = platform_driver_register(&my_platform_driver);
+	if (ret_val !=0)
+	{
+		pr_err("platform value returned %d\n", ret_val);
+		return ret_val;
+	}
+	return 0;
+}
+
+static void __exit hello_exit(void)
+{
+	pr_info("Hello world exit\n");
+	platform_driver_unregister(&my_platform_driver);
+}
+
+
+/* init driver module */
+module_init(hello_init);
+module_exit(hello_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("DoZh <TATQAQTAT@gmail.com>");
