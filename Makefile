@@ -1,5 +1,5 @@
 
-obj-m := helloworld.o
+obj-m := mcu-spi.o
 
 
 KERNEL_DIR ?= ../linux-5.9
