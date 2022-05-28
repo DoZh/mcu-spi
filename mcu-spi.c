@@ -8,7 +8,18 @@
 #include <linux/fs.h>
 #include <linux/of.h>
 #include <linux/uaccess.h>
+#include <linux/crc32.h>
 
+
+#define PREAMBLE_LENGTH 1
+#define SERIAL_NO_LENGTH 1
+#define DATA_DESC_LENGTH 64
+#define PAYLOAD_COUNT_LENGTH 2
+#define MAX_PAYLOAD_LENGTH 1024
+#define VERIFY_LENGTH 4
+#define HEAD_LENGTH PREAMBLE_LENGTH + SERIAL_NO_LENGTH + DATA_DESC_LENGTH + PAYLOAD_COUNT_LENGTH //68
+#define PAYLOAD_SHIFT HEAD_LENGTH
+#define MAX_PACKET_LENGTH HEAD_LENGTH + MAX_PAYLOAD_LENGTH + VERIFY_LENGTH //1096
 
 /* This structure will represent single device */
 struct mcuspi_dev {
@@ -75,9 +86,12 @@ static ssize_t mcuspi_write_file(struct file *file, const char __user *userbuf,
 {
 	int ret = 0;
 
-	//char buf[1024];
 	char *buf;
 	struct mcuspi_dev * mcuspi;
+	uint16_t datacount;
+	static uint8_t serial_no = 0;
+	uint32_t checksum;
+	
 
 	mcuspi = container_of(file->private_data,
 			     struct mcuspi_dev, 
@@ -90,21 +104,43 @@ static ssize_t mcuspi_write_file(struct file *file, const char __user *userbuf,
 		 "we have written %zu characters to file\n", count); 
 
 
-	buf = kzalloc(count + 1, GFP_KERNEL);
 
-	if(copy_from_user(buf, userbuf, count)) {
+	// pre_head 0xAA + serial no(1 Byte) + custom data descriptor(64 Bytes) + payload length(2 bytes, count by bytes) + payload(0~1024 Bytes) + CRC32
+	buf = kzalloc(MAX_PACKET_LENGTH, GFP_KERNEL);
+	buf[0] = 0xAA;
+	buf[PREAMBLE_LENGTH] = serial_no++;
+	count = min(count, (size_t)MAX_PAYLOAD_LENGTH); // use little endian to save payload length 
+	 *(uint16_t *)(buf + PAYLOAD_SHIFT - 2) = count; //check align!
+	//buf[PAYLOAD_SHIFT - 2] = (uint8_t)(count & 0xFF);
+	//buf[PAYLOAD_SHIFT - 1] = (uint8_t)((count >> 8) & 0xFF);
+
+	//for test
+	
+	uint8_t *dataptr = buf + PAYLOAD_SHIFT;
+	uint8_t data = 0;
+	for (datacount = 0 ; datacount < 1024; datacount++)
+	{
+			*dataptr++ = data++;
+	}
+	
+	
+	if(copy_from_user(buf + PAYLOAD_SHIFT, userbuf, count)) {
 		dev_err(&mcuspi->device->dev, "Bad copied value\n");
 		return -EFAULT;
 	}
+	
+	checksum = crc32(0, buf, PAYLOAD_SHIFT + count);
+	*(uint32_t *)(buf + PAYLOAD_SHIFT + count) = checksum; //check align!
 
-	buf[count-1] = '\0';
 
-	ret |= spi_write(mcuspi->device, buf, count);
 
+	ret |= spi_write(mcuspi->device, buf, MAX_PACKET_LENGTH); //MAX_PACKET_LENGTH is for test
+
+	kfree(buf);
 	if (ret < 0)
 		dev_err(&mcuspi->device->dev, "the device is not found, ERRNO: %d\n", ret);
 	else
-		dev_info(&mcuspi->device->dev, "we have written characters to spi bus.\n"); 
+		dev_info(&mcuspi->device->dev, "we have written %zu characters to spi bus.\n", count); 
 
 	dev_info(&mcuspi->device->dev, 
 		 "mcuspi_write_file exited on %s\n", mcuspi->name);
