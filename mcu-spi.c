@@ -8,6 +8,7 @@
 #include <linux/fs.h>
 #include <linux/of.h>
 #include <linux/uaccess.h>
+#include <linux/interrupt.h>
 #include <linux/crc32.h>
 
 
@@ -23,7 +24,7 @@
 
 /* This structure will represent single device */
 struct mcuspi_dev {
-	struct spi_device * device;
+	struct spi_device * spid;
 	struct miscdevice mcu_spi_miscdevice;
 	char name[8]; /* mcuspiX */
 };
@@ -47,7 +48,7 @@ static ssize_t mcuspi_read_file(struct file *file, char __user *userbuf,
 
 	buf = kzalloc(count + 1, GFP_KERNEL);
 	/* read IO expander input to expval */
-	expval = spi_read(mcuspi->device, buf, count);
+	expval = spi_read(mcuspi->spid, buf, count);
 	if (expval < 0)
 		return -EFAULT;
 
@@ -76,6 +77,7 @@ static ssize_t mcuspi_read_file(struct file *file, char __user *userbuf,
 		*ppos+=1;
 		return size+1;
 	}
+	kfree(buf);
 
 	return 0;
 }
@@ -97,10 +99,10 @@ static ssize_t mcuspi_write_file(struct file *file, const char __user *userbuf,
 			     struct mcuspi_dev, 
 			     mcu_spi_miscdevice);
 
-	dev_info(&mcuspi->device->dev, 
+	dev_info(&mcuspi->spid->dev, 
 		 "mcuspi_write_file entered on %s\n", mcuspi->name);
 
-	dev_info(&mcuspi->device->dev,
+	dev_info(&mcuspi->spid->dev,
 		 "we have written %zu characters to file\n", count); 
 
 
@@ -125,7 +127,7 @@ static ssize_t mcuspi_write_file(struct file *file, const char __user *userbuf,
 	
 	
 	if(copy_from_user(buf + PAYLOAD_SHIFT, userbuf, count)) {
-		dev_err(&mcuspi->device->dev, "Bad copied value\n");
+		dev_err(&mcuspi->spid->dev, "Bad copied value\n");
 		return -EFAULT;
 	}
 	
@@ -134,18 +136,41 @@ static ssize_t mcuspi_write_file(struct file *file, const char __user *userbuf,
 
 
 
-	ret |= spi_write(mcuspi->device, buf, MAX_PACKET_LENGTH); //MAX_PACKET_LENGTH is for test
+	ret |= spi_write(mcuspi->spid, buf, MAX_PACKET_LENGTH); 
 
 	kfree(buf);
 	if (ret < 0)
-		dev_err(&mcuspi->device->dev, "the device is not found, ERRNO: %d\n", ret);
+		dev_err(&mcuspi->spid->dev, "the device is not found, ERRNO: %d\n", ret);
 	else
-		dev_info(&mcuspi->device->dev, "we have written %zu characters to spi bus.\n", count); 
+		dev_info(&mcuspi->spid->dev, "we have written %zu characters to spi bus.\n", count); 
 
-	dev_info(&mcuspi->device->dev, 
+	dev_info(&mcuspi->spid->dev, 
 		 "mcuspi_write_file exited on %s\n", mcuspi->name);
 
 	return count;
+}
+
+static irqreturn_t mcu_spi_isr(int irq_no, void *data)
+{
+	int val;
+	struct mcuspi_dev * mcuspi = data;
+	dev_info(&mcuspi->spid->dev, "interrupt received. device: %s\n", mcuspi->name);
+/*
+	val = gpiod_get_value(priv->gpio);
+	dev_info(priv->dev, "Button state: 0x%08X\n", val);
+
+	if (val == 1)
+		hello_keys_buf[buf_wr++] = 'P'; 
+	else
+		hello_keys_buf[buf_wr++] = 'R';
+
+	if (buf_wr >= MAX_KEY_STATES)
+		buf_wr = 0;
+
+	// Wake up the process 
+	wake_up_interruptible(&priv->wq_data_available);
+*/
+	return IRQ_HANDLED;
 }
 
 /* declare a file_operations structure */
@@ -158,10 +183,14 @@ static const struct file_operations mcuspi_fops = {
 static int mcu_spi_probe(struct spi_device *spid)
 {
 	int ret;
+	int err = 0;
 
 	static int counter = 0;
 
 	struct mcuspi_dev * mcuspi;
+
+	struct gpio_desc *interrupt_gpio;
+	int irq_no;
 
 	pr_info("mcu_spi probe\n");
 
@@ -175,7 +204,7 @@ static int mcu_spi_probe(struct spi_device *spid)
 	spi_set_drvdata(spid, mcuspi);
 
 	/* Store pointer to SPI device/client */
-	mcuspi->device = spid;
+	mcuspi->spid = spid;
 
 	/* Initialize the misc device, mcuspi incremented after each probe call */
 	sprintf(mcuspi->name, "mcuspi%01d", counter++); 
@@ -185,6 +214,29 @@ static int mcu_spi_probe(struct spi_device *spid)
 	mcuspi->mcu_spi_miscdevice.name = mcuspi->name;
 	mcuspi->mcu_spi_miscdevice.minor = MISC_DYNAMIC_MINOR;
 	mcuspi->mcu_spi_miscdevice.fops = &mcuspi_fops;
+
+    /* Get GPIO start with "int" in device tree */
+	interrupt_gpio = devm_gpiod_get(&spid->dev, "int", GPIOD_IN);
+	if (IS_ERR(interrupt_gpio)) {
+		dev_err(&spid->dev, "gpio get index failed\n");
+		err = PTR_ERR(interrupt_gpio); /* PTR_ERR return an int from a pointer */
+		return ERR_PTR(err);
+	}
+
+	irq_no = gpiod_to_irq(interrupt_gpio);
+	if (irq_no < 0) {
+		dev_err(&spid->dev, "gpio get irq failed\n");
+		err = irq_no;
+		return ERR_PTR(err);
+	}
+	dev_info(&spid->dev, "The IRQ number is: %d\n", irq_no);
+
+	/* Request threaded interrupt */
+	err = devm_request_threaded_irq(&spid->dev, irq_no, NULL,
+			mcu_spi_isr, IRQF_TRIGGER_FALLING | IRQF_ONESHOT, mcuspi->name, mcuspi);
+	if (err)
+		return ERR_PTR(err);
+
 
 	/* Register misc device */
 	ret =  misc_register(&mcuspi->mcu_spi_miscdevice);
