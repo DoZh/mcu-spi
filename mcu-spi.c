@@ -18,9 +18,9 @@
 #define PAYLOAD_COUNT_LENGTH 2
 #define MAX_PAYLOAD_LENGTH 1024
 #define VERIFY_LENGTH 4
-#define HEAD_LENGTH PREAMBLE_LENGTH + SERIAL_NO_LENGTH + DATA_DESC_LENGTH + PAYLOAD_COUNT_LENGTH //68
+#define HEAD_LENGTH (PREAMBLE_LENGTH + SERIAL_NO_LENGTH + DATA_DESC_LENGTH + PAYLOAD_COUNT_LENGTH) //68
 #define PAYLOAD_SHIFT HEAD_LENGTH
-#define MAX_PACKET_LENGTH HEAD_LENGTH + MAX_PAYLOAD_LENGTH + VERIFY_LENGTH //1096
+#define MAX_PACKET_LENGTH (HEAD_LENGTH + MAX_PAYLOAD_LENGTH + VERIFY_LENGTH) //1096
 
 /* This structure will represent single device */
 struct mcuspi_dev {
@@ -131,7 +131,7 @@ static ssize_t mcuspi_write_file(struct file *file, const char __user *userbuf,
 		return -EFAULT;
 	}
 	
-	checksum = crc32(0, buf, PAYLOAD_SHIFT + count);
+	checksum = crc32(0xFFFFFFFF, buf, HEAD_LENGTH + count);
 	*(uint32_t *)(buf + PAYLOAD_SHIFT + count) = checksum; //check align!
 
 
@@ -240,6 +240,10 @@ static int mcu_spi_probe(struct spi_device *spid)
 
 	/* Register misc device */
 	ret =  misc_register(&mcuspi->mcu_spi_miscdevice);
+
+	//test crc32
+	uint32_t crc32_result = ~crc32(0xFFFFFFFF, "UUUUUUUUUUUUUUUU", 15);
+	dev_info(&spid->dev, "The crc32 is: %x\n", crc32_result);
 
 	dev_info(&spid->dev, 
 		 "mcu_spi_probe is exited on %s\n", mcuspi->name);
