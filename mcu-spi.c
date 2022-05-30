@@ -14,21 +14,107 @@
 
 #define PREAMBLE_LENGTH 1
 #define SERIAL_NO_LENGTH 1
-#define DATA_DESC_LENGTH 64
+#define PAYLOAD_DESC_LENGTH 64
 #define PAYLOAD_COUNT_LENGTH 2
 #define MAX_PAYLOAD_LENGTH 1024
 #define VERIFY_LENGTH 4
-#define HEAD_LENGTH (PREAMBLE_LENGTH + SERIAL_NO_LENGTH + DATA_DESC_LENGTH + PAYLOAD_COUNT_LENGTH) //68
+#define HEAD_LENGTH (PREAMBLE_LENGTH + SERIAL_NO_LENGTH + PAYLOAD_DESC_LENGTH + PAYLOAD_COUNT_LENGTH) //68
 #define PAYLOAD_SHIFT HEAD_LENGTH
 #define MAX_PACKET_LENGTH (HEAD_LENGTH + MAX_PAYLOAD_LENGTH + VERIFY_LENGTH) //1096
+
+#define MAX_BUFFERED_MSG 1024 
 
 /* This structure will represent single device */
 struct mcuspi_dev {
 	struct spi_device * spid;
 	struct miscdevice mcu_spi_miscdevice;
+	struct mcu_message_queue * msg_queue;
 	char name[8]; /* mcuspiX */
 };
 
+typedef struct mcu_message_queue {
+	struct mcu_message * mcu_msg[MAX_BUFFERED_MSG];
+	int16_t read_msg_idx;
+	int16_t write_msg_idx;
+	int16_t msg_count;
+}mcu_message_queue;
+
+/* This structure will save each message that received from MCU */
+typedef struct mcu_message {
+	uint16_t payload_length;
+	uint8_t payload_desc[PAYLOAD_DESC_LENGTH]; 
+	uint8_t * payload;
+}mcu_message;
+
+int init_mcu_message_queue(mcu_message_queue *msg_queue)
+{
+	msg_queue = kzalloc(sizeof(mcu_message_queue), GFP_KERNEL);
+	if (!msg_queue) {
+		return -ENOMEM;
+	}
+	msg_queue->read_msg_idx = 0;
+	msg_queue->write_msg_idx = 0;
+	msg_queue->msg_count = 0;
+	return 0;
+}
+
+int store_one_mcu_message(mcu_message_queue *msg_queue, 
+			uint16_t payload_length, uint8_t *payload_desc, uint8_t *payload)
+{
+	if (msg_queue->msg_count >= MAX_BUFFERED_MSG) {
+		return -ENOSPC;
+	}
+	mcu_message * mcu_msg = kzalloc(sizeof(mcu_message), GFP_KERNEL);
+	if (!mcu_msg) {
+		return -ENOMEM;
+	}
+	memcpy(mcu_msg->payload_desc, payload_desc, PAYLOAD_DESC_LENGTH);
+	mcu_msg->payload = NULL;
+	if (payload_length > 0) {
+		mcu_msg->payload = kzalloc(payload_length, GFP_KERNEL);
+		if (!mcu_msg->payload) {
+			kfree(mcu_msg);
+			return -ENOMEM;
+		}
+		memcpy(mcu_msg->payload, payload, payload_length);
+	}
+	msg_queue->mcu_msg[msg_queue->write_msg_idx] = mcu_msg;
+	(msg_queue->write_msg_idx)++;
+	if ((msg_queue->write_msg_idx) >= MAX_BUFFERED_MSG) {
+		msg_queue->write_msg_idx = 0;
+	}
+	(msg_queue->msg_count)++;
+	return 0;
+}
+
+int load_one_mcu_message(mcu_message_queue *msg_queue,
+			uint16_t *payload_length, uint8_t *payload_desc, uint8_t *payload)
+{
+	if (msg_queue->msg_count <= 0) {
+		return -EAGAIN;
+	}
+	mcu_message * mcu_msg = msg_queue->mcu_msg[msg_queue->read_msg_idx];
+	if (!mcu_msg) {
+		return -EFAULT; 
+	}
+	memcpy(payload_desc, mcu_msg->payload_desc, PAYLOAD_DESC_LENGTH);
+	*payload_length = mcu_msg->payload_length;
+	if (mcu_msg->payload_length > 0) {
+		if (!mcu_msg->payload) {
+			return -EFAULT;
+		}
+		memcpy(payload, mcu_msg->payload, mcu_msg->payload_length);
+		kfree (mcu_msg->payload);
+	}
+	kfree(mcu_msg);
+	msg_queue->mcu_msg[msg_queue->read_msg_idx] = NULL;
+	(msg_queue->read_msg_idx)++;
+	if ((msg_queue->read_msg_idx) >= MAX_BUFFERED_MSG) {
+		msg_queue->read_msg_idx = 0;
+	}
+	(msg_queue->msg_count)--;
+	return 0;
+}
 
 /* User is reading data from /dev/mcuspiX */
 static ssize_t mcuspi_read_file(struct file *file, char __user *userbuf,
