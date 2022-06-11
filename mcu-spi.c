@@ -31,7 +31,7 @@
 struct mcuspi_dev {
 	struct spi_device * spid;
 	struct miscdevice mcu_spi_miscdevice;
-	struct mcu_message_queue * msg_queue;
+	struct mcu_message_queue * recv_msg_queue;
 	char name[8]; /* mcuspiX */
 };
 
@@ -108,6 +108,7 @@ int store_one_mcu_message(mcu_message_queue *msg_queue,
 	
 	memcpy(mcu_msg->payload_desc, payload_desc, PAYLOAD_DESC_LENGTH);
 	mcu_msg->payload = NULL;
+	mcu_msg->payload_length = payload_length;
 	if (payload_length > 0) {
 		mcu_msg->payload = kzalloc(payload_length, GFP_KERNEL);
 		if (!mcu_msg->payload) {
@@ -333,7 +334,6 @@ static ssize_t mcuspi_write_file(struct file *file, const char __user *userbuf,
 	//buf[PAYLOAD_SHIFT - 1] = (uint8_t)((count >> 8) & 0xFF);
 
 	//for test
-	
 	uint8_t *dataptr = buf + PAYLOAD_SHIFT;
 	uint8_t data = 0;
 	for (datacount = 0 ; datacount < 1024; datacount++)
@@ -347,7 +347,7 @@ static ssize_t mcuspi_write_file(struct file *file, const char __user *userbuf,
 		return -EFAULT;
 	}
 	
-	checksum = crc32(0xFFFFFFFF, buf, HEAD_LENGTH + count);
+	checksum = ~crc32(0xFFFFFFFF, buf, HEAD_LENGTH + count);
 	*(uint32_t *)(buf + PAYLOAD_SHIFT + count) = checksum; //check align!
 
 
@@ -373,7 +373,7 @@ static irqreturn_t mcu_spi_isr(int irq_no, void *data)
 	uint8_t *buf;
 	int status = 0;
 	int payload_length = 0;
-
+	uint32_t checksum;
 
 	dev_info(&mcuspi->spid->dev, "interrupt received. device: %s\n", mcuspi->name);
 	buf = kzalloc(MAX_PACKET_LENGTH, GFP_KERNEL);
@@ -387,12 +387,21 @@ static irqreturn_t mcu_spi_isr(int irq_no, void *data)
 		kfree(buf);
 		return IRQ_HANDLED;
 	}
+	
 
 	dev_dump_hex(buf, MAX_PACKET_LENGTH);
 
 	payload_length = *(uint16_t *)(buf + PAYLOAD_SHIFT - 2);
 	payload_length = max(payload_length, 0);
 	payload_length = min(payload_length, MAX_PAYLOAD_LENGTH);
+	checksum = ~crc32(0xFFFFFFFF, buf, HEAD_LENGTH + payload_length);
+	dev_info(&mcuspi->spid->dev, "crc32 checksum = %08x, msg_checksum = %08x\n", checksum, *(uint32_t *)(buf + PAYLOAD_SHIFT + payload_length));
+	if (checksum != *(uint32_t *)(buf + PAYLOAD_SHIFT + payload_length)) {
+		dev_info(&mcuspi->spid->dev, "crc32 checksum mismatch in isr. device: %s\nchecksum = %08x, msg_checksum = %08x\n", 
+					mcuspi->name, checksum, *(uint32_t *)(buf + PAYLOAD_SHIFT + payload_length));
+		kfree(buf);
+		return IRQ_HANDLED;
+	}
 	
 	dev_info(&mcuspi->spid->dev,
 		 "store_one_mcu_message, payload_length:%d, PREAMBLE_LENGTH + SERIAL_NO_LENGTH:%d, PAYLOAD_SHIFT:%d\n", 
@@ -402,8 +411,8 @@ static irqreturn_t mcu_spi_isr(int irq_no, void *data)
 		 "store_one_mcu_message, buf:%ld, payload_desc:%ld, payload:%ld\n", 
 		 		buf, buf + PREAMBLE_LENGTH + SERIAL_NO_LENGTH, buf + PAYLOAD_SHIFT);
 
-	printk("mcuspi->msg_queue:%p\n", mcuspi->msg_queue); 
-	status = store_one_mcu_message(mcuspi->msg_queue, 
+	printk("mcuspi->recv_msg_queue:%p\n", mcuspi->recv_msg_queue); 
+	status = store_one_mcu_message(mcuspi->recv_msg_queue, 
 			payload_length, buf + PREAMBLE_LENGTH + SERIAL_NO_LENGTH, buf + PAYLOAD_SHIFT);
 	kfree(buf);
 
@@ -438,13 +447,14 @@ static ssize_t recv_payload_show(struct device *dev,
 
 	spid = to_spi_device(dev);
 	mcuspi = spi_get_drvdata(spid);
-	msg_queue = mcuspi->msg_queue;
+	msg_queue = mcuspi->recv_msg_queue;
 	mcu_msg = msg_queue->mcu_msg[msg_queue->read_msg_idx];
 	if (!mcu_msg) {
 		return -EFAULT; 
 	}
-	if (mcu_msg->payload_length > 0)
+	if (mcu_msg->payload_length > 0) {
 		memcpy(buf, mcu_msg->payload, mcu_msg->payload_length);
+	}
 	return mcu_msg->payload_length;
 }
 static DEVICE_ATTR(payload, S_IRUGO, recv_payload_show, NULL);
@@ -460,11 +470,14 @@ static ssize_t recv_payload_len_show(struct device *dev,
 
 	spid = to_spi_device(dev);
 	mcuspi = spi_get_drvdata(spid);
-	msg_queue = mcuspi->msg_queue;
+	msg_queue = mcuspi->recv_msg_queue;
 	mcu_msg = msg_queue->mcu_msg[msg_queue->read_msg_idx];
 	if (!mcu_msg) {
 		return -EFAULT; 
 	}
+	dev_info(&mcuspi->spid->dev,
+		 "recv_payload_len_show, spid:%p, mcuspi:%p, msg_queue:%p, payload_len:%d\n", 
+	 		spid, mcuspi, msg_queue, mcu_msg->payload_length);
 	memcpy(buf, &(mcu_msg->payload_length), sizeof(mcu_msg->payload_length));
 	return sizeof(mcu_msg->payload_length);
 }
@@ -480,7 +493,7 @@ static ssize_t recv_payload_desc_show(struct device *dev,
 
 	spid = to_spi_device(dev);
 	mcuspi = spi_get_drvdata(spid);
-	msg_queue = mcuspi->msg_queue;
+	msg_queue = mcuspi->recv_msg_queue;
 	mcu_msg = msg_queue->mcu_msg[msg_queue->read_msg_idx];
 	if (!mcu_msg) {
 		return -EFAULT; 
@@ -499,7 +512,7 @@ static ssize_t recv_remain_msg_count_show(struct device *dev,
 
 	spid = to_spi_device(dev);
 	mcuspi = spi_get_drvdata(spid);
-	msg_queue = mcuspi->msg_queue;
+	msg_queue = mcuspi->recv_msg_queue;
 
 	dev_info(&mcuspi->spid->dev,
 		 "recv_remain_msg_count_show, spid:%p, mcuspi:%p, msg_queue:%p, msg_cnt:%d\n", 
@@ -521,7 +534,7 @@ static ssize_t recv_get_msg_store(struct device *dev,
 
 	spid = to_spi_device(dev);
 	mcuspi = spi_get_drvdata(spid);
-	msg_queue = mcuspi->msg_queue;
+	msg_queue = mcuspi->recv_msg_queue;
 
 	//clean up memory of previous msg
 	prev_mcu_msg = msg_queue->mcu_msg[msg_queue->read_msg_idx];
@@ -649,7 +662,7 @@ static int mcu_spi_probe(struct spi_device *spid)
 	/* Register misc device */
 	ret |=  misc_register(&mcuspi->mcu_spi_miscdevice);
 
-	ret |= init_mcu_message_queue(&mcuspi->msg_queue);
+	ret |= init_mcu_message_queue(&mcuspi->recv_msg_queue);
 	
 	//test crc32
 	uint32_t crc32_result = ~crc32(0xFFFFFFFF, "UUUUUUUUUUUUUUUU", 15);
@@ -673,7 +686,7 @@ static int mcu_spi_remove(struct spi_device *spid)
 	dev_info(&spid->dev, 
 		 "mcu_spi_remove is entered on %s\n", mcuspi->name);
 
-	deinit_mcu_message_queue(mcuspi->msg_queue);
+	deinit_mcu_message_queue(mcuspi->recv_msg_queue);
 	
 	/* Deregister misc device */
 	misc_deregister(&mcuspi->mcu_spi_miscdevice);
