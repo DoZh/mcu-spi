@@ -319,11 +319,6 @@ int deinit_mcu_message(mcu_message *msg)
 }
 
 
-int parser_string_to_msg (uint8_t *str, uint8_t *payload_desc, uint16_t *count, uint8_t *payload)
-{
-	return 0;
-}
-
 /* User is reading data from /dev/mcuspiX */
 static ssize_t mcuspi_read_file(struct file *file, char __user *userbuf,
                                size_t count, loff_t *ppos)
@@ -386,10 +381,8 @@ static ssize_t mcuspi_write_file(struct file *file, const char __user *userbuf,
 
 	char *buf;
 	struct mcuspi_dev * mcuspi;
-	uint16_t datacount;
-	static uint8_t serial_no = 0;
-	uint32_t checksum;
-	
+	struct mcu_message * mcu_msg;
+	uint8_t * sendbuf = NULL;
 
 	mcuspi = container_of(file->private_data,
 			     struct mcuspi_dev, 
@@ -401,40 +394,30 @@ static ssize_t mcuspi_write_file(struct file *file, const char __user *userbuf,
 	dev_info(&mcuspi->spid->dev,
 		 "we have written %zu characters to file\n", count); 
 
-
-
-	// pre_head 0xAA + serial no(1 Byte) + custom data descriptor(64 Bytes) + payload length(2 bytes, count by bytes) + payload(0~1024 Bytes) + CRC32
-	buf = kzalloc(MAX_PACKET_LENGTH, GFP_KERNEL);
-	buf[0] = 0xAA;
-	buf[PREAMBLE_LENGTH] = serial_no++;
-	count = min(count, (size_t)MAX_PAYLOAD_LENGTH); // use little endian to save payload length 
-	 *(uint16_t *)(buf + PAYLOAD_SHIFT - 2) = count; //check align!
-	//buf[PAYLOAD_SHIFT - 2] = (uint8_t)(count & 0xFF);
-	//buf[PAYLOAD_SHIFT - 1] = (uint8_t)((count >> 8) & 0xFF);
-
-	//for test
-	uint8_t *dataptr = buf + PAYLOAD_SHIFT;
-	uint8_t data = 0;
-	for (datacount = 0 ; datacount < 1024; datacount++)
-	{
-			*dataptr++ = data++;
+	mcu_msg = mcuspi->send_msg;
+	if (!mcu_msg) {
+		return -EFAULT; 
 	}
-	
-	
-	if(copy_from_user(buf + PAYLOAD_SHIFT, userbuf, count)) {
-		dev_err(&mcuspi->spid->dev, "Bad copied value\n");
-		return -EFAULT;
+	mcu_msg->payload_length = max(count, 0);
+	mcu_msg->payload_length  = min(count, MAX_PAYLOAD_LENGTH);
+	if (mcu_msg->payload_length > 0) {
+		if(copy_from_user(mcu_msg->payload, userbuf, mcu_msg->payload_length)) {
+			dev_err(&mcuspi->spid->dev, "Bad copied value\n");
+			return -EFAULT;
+		}
 	}
+
+	sendbuf = kzalloc(MAX_PACKET_LENGTH, GFP_KERNEL);
+	if (!sendbuf) {
+		return -ENOMEM; 
+	}
+	pack_one_mcu_message(mcu_msg, sendbuf);
 	
-	checksum = ~crc32(0xFFFFFFFF, buf, HEAD_LENGTH + count);
-	*(uint32_t *)(buf + PAYLOAD_SHIFT + count) = checksum; //check align!
+	ret |= spi_write(mcuspi->spid, sendbuf, MAX_PACKET_LENGTH); //it use a fixed length(MAX_PACKET_LENGTH) in PHY.
 
+	kfree(sendbuf);
 
-
-	ret |= spi_write(mcuspi->spid, buf, MAX_PACKET_LENGTH); 
-
-	kfree(buf);
-	if (ret < 0)
+	if (ret < 0) 
 		dev_err(&mcuspi->spid->dev, "the device is not found, ERRNO: %d\n", ret);
 	else
 		dev_info(&mcuspi->spid->dev, "we have written %zu characters to spi bus.\n", count); 
