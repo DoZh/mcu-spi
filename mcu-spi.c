@@ -27,11 +27,20 @@
 
 #define MAX_BUFFERED_MSG 1024 
 
+#define BIN_ATTR(_name, _mode, _show, _store) \
+struct bin_attribute  bin_attr_##_name = { \
+	.attr = {.name = __stringify(_name),				\
+		.mode = VERIFY_OCTAL_PERMISSIONS(_mode) },		\
+	.read	= _show,						\
+	.write	= _store,						\
+}
+
 /* This structure will represent single device */
 struct mcuspi_dev {
 	struct spi_device * spid;
 	struct miscdevice mcu_spi_miscdevice;
 	struct mcu_message_queue * recv_msg_queue;
+	struct mcu_message * send_msg;
 	char name[8]; /* mcuspiX */
 };
 
@@ -223,7 +232,7 @@ int init_mcu_message_queue(mcu_message_queue **msg_queue)
 	(*msg_queue)->read_msg_idx = MAX_BUFFERED_MSG - 1;
 	(*msg_queue)->write_msg_idx = 0;
 	(*msg_queue)->msg_count = 0;
-	printk("init_mcu_message_queue:%p\n", *msg_queue);
+	printk("init_mcu_message_queue:%08x\n", *msg_queue);
 	return 0;
 }
 
@@ -236,6 +245,33 @@ int deinit_mcu_message_queue(mcu_message_queue *msg_queue)
 		drop_one_mcu_message(msg_queue);
 	}
 	kfree(msg_queue);
+	return 0;
+}
+
+int init_mcu_message(mcu_message **msg)
+{
+	*msg = kzalloc(sizeof(mcu_message), GFP_KERNEL);
+	if (!msg) {
+		return -ENOMEM;
+	}
+
+	(*msg)->payload = kzalloc(MAX_PAYLOAD_LENGTH, GFP_KERNEL);
+	if (!(*msg)->payload) {
+		kfree(msg);
+		return -ENOMEM;
+	}
+
+	printk("init_mcu_message:%08x\n", *msg);
+	return 0;
+}
+
+int deinit_mcu_message(mcu_message *msg)
+{
+	if (!msg) {
+		return -EFAULT;
+	}
+	kfree(msg->payload);
+	kfree(msg);
 	return 0;
 }
 
@@ -437,38 +473,40 @@ static irqreturn_t mcu_spi_isr(int irq_no, void *data)
 	return IRQ_HANDLED;
 }
 
-static ssize_t recv_payload_show(struct device *dev,
-				 struct device_attribute *attr, char *buf)
+static ssize_t recv_payload_show(struct file *filp, struct kobject *kobj,
+		struct bin_attribute *attr, char *buf, loff_t off, size_t count)
 {	
 	struct mcuspi_dev * mcuspi;
 	struct spi_device * spid;
 	struct mcu_message_queue * msg_queue;
 	struct mcu_message * mcu_msg;
 
-	spid = to_spi_device(dev);
+	spid = to_spi_device(kobj_to_dev(kobj->parent));
 	mcuspi = spi_get_drvdata(spid);
 	msg_queue = mcuspi->recv_msg_queue;
 	mcu_msg = msg_queue->mcu_msg[msg_queue->read_msg_idx];
 	if (!mcu_msg) {
 		return -EFAULT; 
 	}
-	if (mcu_msg->payload_length > 0) {
-		memcpy(buf, mcu_msg->payload, mcu_msg->payload_length);
+	count = min(count, mcu_msg->payload_length);
+	off = min(off, mcu_msg->payload_length - count);
+	if (count > 0) {
+		memcpy(buf, mcu_msg->payload + off, count);
 	}
-	return mcu_msg->payload_length;
+	return count;
 }
-static DEVICE_ATTR(payload, S_IRUGO, recv_payload_show, NULL);
+static BIN_ATTR(recv_payload, S_IRUGO, recv_payload_show, NULL);
 
 
-static ssize_t recv_payload_len_show(struct device *dev,
-				 struct device_attribute *attr, char *buf)
+static ssize_t recv_payload_len_show(struct file *filp, struct kobject *kobj,
+		struct bin_attribute *attr, char *buf, loff_t off, size_t count)
 {
 	struct mcuspi_dev * mcuspi;
 	struct spi_device * spid;
 	struct mcu_message_queue * msg_queue;
 	struct mcu_message * mcu_msg;
 
-	spid = to_spi_device(dev);
+	spid = to_spi_device(kobj_to_dev(kobj->parent));
 	mcuspi = spi_get_drvdata(spid);
 	msg_queue = mcuspi->recv_msg_queue;
 	mcu_msg = msg_queue->mcu_msg[msg_queue->read_msg_idx];
@@ -478,61 +516,65 @@ static ssize_t recv_payload_len_show(struct device *dev,
 	dev_info(&mcuspi->spid->dev,
 		 "recv_payload_len_show, spid:%p, mcuspi:%p, msg_queue:%p, payload_len:%d\n", 
 	 		spid, mcuspi, msg_queue, mcu_msg->payload_length);
-	memcpy(buf, &(mcu_msg->payload_length), sizeof(mcu_msg->payload_length));
-	return sizeof(mcu_msg->payload_length);
+	count = min(count, sizeof(mcu_msg->payload_length));
+	off = min(off, sizeof(mcu_msg->payload_length) - count);
+	memcpy(buf, &(mcu_msg->payload_length) + off, count);
+	return count;
 }
-static DEVICE_ATTR(payload_len, S_IRUGO, recv_payload_len_show, NULL);
+static BIN_ATTR(recv_payload_len, S_IRUGO, recv_payload_len_show, NULL);
 
-static ssize_t recv_payload_desc_show(struct device *dev,
-				 struct device_attribute *attr, char *buf)
+static ssize_t recv_payload_desc_show(struct file *filp, struct kobject *kobj,
+		struct bin_attribute *attr, char *buf, loff_t off, size_t count)
 {
 	struct mcuspi_dev * mcuspi;
 	struct spi_device * spid;
 	struct mcu_message_queue * msg_queue;
 	struct mcu_message * mcu_msg;
 
-	spid = to_spi_device(dev);
+	spid = to_spi_device(kobj_to_dev(kobj->parent));
 	mcuspi = spi_get_drvdata(spid);
 	msg_queue = mcuspi->recv_msg_queue;
 	mcu_msg = msg_queue->mcu_msg[msg_queue->read_msg_idx];
 	if (!mcu_msg) {
 		return -EFAULT; 
 	}
-	memcpy(buf, mcu_msg->payload_desc, PAYLOAD_DESC_LENGTH);
-	return PAYLOAD_DESC_LENGTH;
+	count = min(count, PAYLOAD_DESC_LENGTH);
+	off = min(off, PAYLOAD_DESC_LENGTH - count);
+	memcpy(buf, mcu_msg->payload_desc + off, count);
+	return count;
 }
-static DEVICE_ATTR(payload_desc, S_IRUGO, recv_payload_desc_show, NULL);
+static BIN_ATTR(recv_payload_desc, S_IRUGO, recv_payload_desc_show, NULL);
 
-static ssize_t recv_remain_msg_count_show(struct device *dev,
-				 struct device_attribute *attr, char *buf)
+static ssize_t recv_remain_msg_count_show(struct file *filp, struct kobject *kobj,
+		struct bin_attribute *attr, char *buf, loff_t off, size_t count)
 {
 	struct mcuspi_dev * mcuspi;
 	struct spi_device * spid;
 	struct mcu_message_queue * msg_queue;
 
-	spid = to_spi_device(dev);
+	spid = to_spi_device(kobj_to_dev(kobj->parent));
 	mcuspi = spi_get_drvdata(spid);
 	msg_queue = mcuspi->recv_msg_queue;
 
 	dev_info(&mcuspi->spid->dev,
 		 "recv_remain_msg_count_show, spid:%p, mcuspi:%p, msg_queue:%p, msg_cnt:%d\n", 
 	 		spid, mcuspi, msg_queue, msg_queue->msg_count);
-
-	memcpy(buf, &(msg_queue->msg_count), sizeof(msg_queue->msg_count));
-	return sizeof(msg_queue->msg_count);
+	count = min(count, sizeof(msg_queue->msg_count));
+	off = min(off, sizeof(msg_queue->msg_count) - count);
+	memcpy(buf, &(msg_queue->msg_count) + off, count);
+	return count;
 }
-static DEVICE_ATTR(remain_msg_count, S_IRUGO, recv_remain_msg_count_show, NULL);
+static BIN_ATTR(remain_msg_count, S_IRUGO, recv_remain_msg_count_show, NULL);
 
-static ssize_t recv_get_msg_store(struct device *dev,
-				 struct device_attribute *attr, const char *buf,
-				 size_t count)
+static ssize_t recv_get_msg_store(struct file *filp, struct kobject *kobj,
+		struct bin_attribute *attr, char *buf, loff_t off, size_t count)
 {
 	struct mcuspi_dev * mcuspi;
 	struct spi_device * spid;
 	struct mcu_message_queue * msg_queue;
 	struct mcu_message * prev_mcu_msg;
 
-	spid = to_spi_device(dev);
+	spid = to_spi_device(kobj_to_dev(kobj->parent));
 	mcuspi = spi_get_drvdata(spid);
 	msg_queue = mcuspi->recv_msg_queue;
 
@@ -567,24 +609,133 @@ static ssize_t recv_get_msg_store(struct device *dev,
 	*/
 	return count;
 }
-static DEVICE_ATTR(get_msg, S_IWUSR|S_IWGRP, NULL, recv_get_msg_store);
+static BIN_ATTR(get_msg, S_IWUSR|S_IWGRP, NULL, recv_get_msg_store);
 
-static struct attribute *recv_msg_attributes[] = {
-	&dev_attr_payload.attr,
-	&dev_attr_payload_len.attr,
-	&dev_attr_payload_desc.attr,
-	&dev_attr_remain_msg_count.attr,
-	&dev_attr_get_msg.attr,
+static struct bin_attribute *recv_msg_attributes[] = {
+	&bin_attr_recv_payload,
+	&bin_attr_recv_payload_len,
+	&bin_attr_recv_payload_desc,
+	&bin_attr_remain_msg_count,
+	&bin_attr_get_msg,
 	NULL
 };
 
 static const struct attribute_group recv_msg_attr_group = {
-	.attrs = recv_msg_attributes,
+	.bin_attrs = recv_msg_attributes,
 	.name = RECV_SYSFS_DIR_NAME,
+};
+
+
+static ssize_t send_payload_store(struct file *filp, struct kobject *kobj,
+		struct bin_attribute *attr, char *buf, loff_t off, size_t count)
+{	
+	
+	struct mcuspi_dev * mcuspi;
+	struct spi_device * spid;
+	struct mcu_message * mcu_msg;
+
+	printk("send_payload_store init\n");
+	//return count;
+	spid = to_spi_device(kobj_to_dev(kobj->parent));
+	printk( "send_payload_store after to_spi_device\n");
+	mcuspi = spi_get_drvdata(spid);
+	mcu_msg = mcuspi->send_msg;
+	if (!mcu_msg) {
+		return -EFAULT; 
+	}
+	mcu_msg->payload_length = (off == 0 ? count : mcu_msg->payload_length + count);
+	mcu_msg->payload_length = max(mcu_msg->payload_length, 0);
+	mcu_msg->payload_length  = min(mcu_msg->payload_length , MAX_PAYLOAD_LENGTH);
+	off = min(off, mcu_msg->payload_length - count);
+
+	if (mcu_msg->payload_length > 0) {
+		memcpy(mcu_msg->payload + off, buf, mcu_msg->payload_length);
+	}
+	
+	return mcu_msg->payload_length;
+}
+static BIN_ATTR(send_payload, S_IWUSR|S_IWGRP, NULL, send_payload_store);
+
+
+static ssize_t send_payload_len_store(struct file *filp, struct kobject *kobj,
+		struct bin_attribute *attr, char *buf, loff_t off, size_t count)
+{
+	struct mcuspi_dev * mcuspi;
+	struct spi_device * spid;
+	struct mcu_message * mcu_msg;
+
+	spid = to_spi_device(kobj_to_dev(kobj->parent));
+	mcuspi = spi_get_drvdata(spid);
+	mcu_msg = mcuspi->send_msg;
+	if (!mcu_msg) {
+		return -EFAULT; 
+	}
+	if (off == 0) {
+		mcu_msg->payload_length = *(uint32_t *)count;
+		mcu_msg->payload_length = max(mcu_msg->payload_length, 0);
+		mcu_msg->payload_length  = min(mcu_msg->payload_length , MAX_PAYLOAD_LENGTH);
+	}
+	
+	return sizeof(mcu_msg->payload_length);
+}
+static BIN_ATTR(send_payload_len, S_IWUSR|S_IWGRP, NULL, send_payload_len_store);
+
+static ssize_t send_payload_desc_store(struct file *filp, struct kobject *kobj,
+		struct bin_attribute *attr, char *buf, loff_t off, size_t count)
+{
+	struct mcuspi_dev * mcuspi;
+	struct spi_device * spid;
+	struct mcu_message * mcu_msg;
+
+	spid = to_spi_device(kobj_to_dev(kobj->parent));
+	mcuspi = spi_get_drvdata(spid);
+	mcu_msg = mcuspi->send_msg;
+	if (!mcu_msg) {
+		return -EFAULT; 
+	}
+	count = min(count, PAYLOAD_DESC_LENGTH);
+	off = min(off, PAYLOAD_DESC_LENGTH - count);
+	memcpy(mcu_msg->payload_desc + off, buf, count);
+	return count;
+}
+static BIN_ATTR(send_payload_desc, S_IWUSR|S_IWGRP, NULL, send_payload_desc_store);
+
+static ssize_t send_put_msg_store(struct file *filp, struct kobject *kobj,
+		struct bin_attribute *attr, char *buf, loff_t off, size_t count)
+{
+	struct mcuspi_dev * mcuspi;
+	struct spi_device * spid;
+	struct mcu_message * mcu_msg;
+
+	spid = to_spi_device(kobj_to_dev(kobj->parent));
+	mcuspi = spi_get_drvdata(spid);
+	mcu_msg = mcuspi->send_msg;
+	if (!mcu_msg) {
+		return -EFAULT; 
+	}
+
+
+	return count;
+}
+static BIN_ATTR(put_msg, S_IWUSR|S_IWGRP, NULL, send_put_msg_store);
+
+
+static struct bin_attribute *send_msg_attributes[] = {
+	&bin_attr_send_payload,
+	&bin_attr_send_payload_len,
+	&bin_attr_send_payload_desc,
+	&bin_attr_put_msg,
+	NULL
+};
+
+static const struct attribute_group send_msg_attr_group = {
+	.bin_attrs = send_msg_attributes,
+	.name = SEND_SYSFS_DIR_NAME,
 };
 
 static const struct attribute_group *msg_attr_groups[] = {
 	&recv_msg_attr_group,
+	&send_msg_attr_group,
 	NULL,
 };
 
@@ -594,6 +745,47 @@ static const struct file_operations mcuspi_fops = {
 	.read = mcuspi_read_file,
 	.write = mcuspi_write_file,
 };
+
+static int mcu_spi_init_sysfs(struct spi_device *spid) 
+{
+	int ret = 0;
+	int i = 0;
+	struct kobject *send_subdir = kobject_create_and_add(send_msg_attr_group.name,
+                                             &spid->dev.kobj);
+
+	for (i = 0; send_msg_attributes[i]; i++) {
+		ret |= sysfs_create_bin_file(send_subdir, send_msg_attributes[i]);
+	}
+	struct kobject *recv_subdir = kobject_create_and_add(recv_msg_attr_group.name,
+                                             &spid->dev.kobj);
+	for (i = 0; recv_msg_attributes[i]; i++) {
+		ret |= sysfs_create_bin_file(recv_subdir, recv_msg_attributes[i]);
+	}
+	return ret;
+}
+
+
+static int mcu_spi_deinit_sysfs(struct spi_device *spid) 
+{
+	int i = 0;
+	/* Find the kobj from the path and parent kset */
+	struct kobject *send_subdir = kset_find_obj(spid->dev.kobj.kset, send_msg_attr_group.name);
+	struct kobject *recv_subdir = kset_find_obj(spid->dev.kobj.kset, recv_msg_attr_group.name);
+	/* check kobj is not null etc. */
+	if (send_subdir) {
+		for (i = 0; send_msg_attributes[i]; i++) {
+			sysfs_remove_bin_file(send_subdir, send_msg_attributes[i]);
+		}
+		/* Remove the sysfs entry */
+		kobject_del(send_subdir);
+	}
+	if (recv_subdir) {
+		for (i = 0; send_msg_attributes[i]; i++) {
+			sysfs_remove_bin_file(recv_subdir, recv_msg_attributes[i]);
+		}
+		kobject_del(recv_subdir);
+	}
+}
 
 static int mcu_spi_probe(struct spi_device *spid)
 {
@@ -654,8 +846,11 @@ static int mcu_spi_probe(struct spi_device *spid)
 
 
 	/* Register sysfs hooks */
-	ret |= sysfs_create_groups(&spid->dev.kobj, msg_attr_groups);
-	//ret |= sysfs_create_group(&spid->dev.kobj, &recv_msg_attr_group);
+	//ret |= sysfs_create_groups(&spid->dev.kobj, msg_attr_groups);
+	mcu_spi_init_sysfs(spid);
+	
+
+	
 	dev_info(&spid->dev, "spid->dev.kobj: %s", spid->dev.kobj.name);
 	//sysfs file may under /sys/class/spi_master/spix/spix.y/ZZZ
 
@@ -663,7 +858,7 @@ static int mcu_spi_probe(struct spi_device *spid)
 	ret |=  misc_register(&mcuspi->mcu_spi_miscdevice);
 
 	ret |= init_mcu_message_queue(&mcuspi->recv_msg_queue);
-	
+	ret |= init_mcu_message(&mcuspi->send_msg);
 	//test crc32
 	uint32_t crc32_result = ~crc32(0xFFFFFFFF, "UUUUUUUUUUUUUUUU", 15);
 	dev_info(&spid->dev, "The crc32 is: %x\n", crc32_result);
@@ -687,13 +882,13 @@ static int mcu_spi_remove(struct spi_device *spid)
 		 "mcu_spi_remove is entered on %s\n", mcuspi->name);
 
 	deinit_mcu_message_queue(mcuspi->recv_msg_queue);
-	
+	deinit_mcu_message(mcuspi->send_msg);
 	/* Deregister misc device */
 	misc_deregister(&mcuspi->mcu_spi_miscdevice);
 
 	/* Deregister sysfs hooks */
-	sysfs_remove_groups(&spid->dev.kobj, msg_attr_groups);
-	//sysfs_remove_group(&spid->dev.kobj, &recv_msg_attr_group);
+	//sysfs_remove_groups(&spid->dev.kobj, msg_attr_groups);
+	mcu_spi_deinit_sysfs(spid);
 
 	dev_info(&spid->dev, 
 		 "mcu_spi_remove is exited on %s\n", mcuspi->name);
