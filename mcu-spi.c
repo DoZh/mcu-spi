@@ -39,8 +39,9 @@ struct bin_attribute  bin_attr_##_name = { \
 struct mcuspi_dev {
 	struct spi_device * spid;
 	struct miscdevice mcu_spi_miscdevice;
-	struct mcu_message_queue * recv_msg_queue;
-	struct mcu_message * send_msg;
+	struct mcu_message_queue * recv_msg_queue; /* msg buff to store received msgs from ext interrupt*/
+	struct mcu_message * send_msg;	/* store the send_msg being processed by userspace*/
+	struct mcu_message * recv_msg;  /* store the recv_msg being processed by userspace*/
 	struct kobject *send_subdir;
 	struct kobject *recv_subdir;
 	char name[8]; /* mcuspiX */
@@ -104,10 +105,11 @@ int get_payload_len_in_next_mcu_msg(mcu_message_queue *msg_queue)
 	return msg_queue->mcu_msg[msg_queue->read_msg_idx]->payload_length;
 }
 
-int store_one_mcu_message(mcu_message_queue *msg_queue, 
+int store_one_mcu_message_to_queue(mcu_message_queue *msg_queue, 
 			uint16_t payload_length, uint8_t *payload_desc, uint8_t *payload)
 {
-	printk("store_one_mcu_message\n");
+	//TODO: rewrite it use mcu_message instead of seperated payload_xxx
+	printk("store_one_mcu_message_to_queue\n");
 	if (msg_queue->msg_count >= MAX_BUFFERED_MSG) {
 		return -ENOSPC;
 	}
@@ -137,8 +139,7 @@ int store_one_mcu_message(mcu_message_queue *msg_queue,
 	return 0;
 }
 
-int load_one_mcu_message(mcu_message_queue *msg_queue,
-			uint16_t *payload_length, uint8_t *payload_desc, uint8_t *payload)
+int load_one_mcu_message_from_queue(mcu_message_queue *msg_queue, mcu_message *mcu_msg)
 {
 	if (msg_queue->msg_count <= 0) {
 		return -EAGAIN;
@@ -158,32 +159,32 @@ int load_one_mcu_message(mcu_message_queue *msg_queue,
 		msg_queue->mcu_msg[msg_queue->read_msg_idx] = NULL;
 	}
 
-	(msg_queue->read_msg_idx)++;
+	(msg_queue->read_msg_idx)++; //TODO: check if can add it at every load_msg step.
 	if ((msg_queue->read_msg_idx) >= MAX_BUFFERED_MSG) {
 		msg_queue->read_msg_idx = 0;
 	}
-	mcu_message * mcu_msg = msg_queue->mcu_msg[msg_queue->read_msg_idx];
-	if (!mcu_msg) {
+	mcu_message * this_mcu_msg = msg_queue->mcu_msg[msg_queue->read_msg_idx];
+	if (!this_mcu_msg) {
 		return -EFAULT; 
 	}
-	memcpy(payload_desc, mcu_msg->payload_desc, PAYLOAD_DESC_LENGTH);
-	*payload_length = mcu_msg->payload_length;
-	if (mcu_msg->payload_length > 0) {
-		if (!mcu_msg->payload) {
+	memcpy(mcu_msg->payload_desc, this_mcu_msg->payload_desc, PAYLOAD_DESC_LENGTH);
+	mcu_msg->payload_length = this_mcu_msg->payload_length;
+	if (this_mcu_msg->payload_length > 0) {
+		if (!this_mcu_msg->payload) {
 			return -EFAULT;
 		}
-		memcpy(payload, mcu_msg->payload, mcu_msg->payload_length);
-		kfree (mcu_msg->payload);
-		mcu_msg->payload = NULL;
+		memcpy(mcu_msg->payload, this_mcu_msg->payload, this_mcu_msg->payload_length);
+		kfree (this_mcu_msg->payload);
+		this_mcu_msg->payload = NULL;
 	}
-	kfree(mcu_msg);
+	kfree(this_mcu_msg);
 	msg_queue->mcu_msg[msg_queue->read_msg_idx] = NULL;
 
 	(msg_queue->msg_count)--;
 	return 0;
 }
 
-int drop_one_mcu_message(mcu_message_queue *msg_queue)
+int drop_one_mcu_message_from_queue(mcu_message_queue *msg_queue)
 {
 	if (msg_queue->msg_count <= 0) {
 		return -EAGAIN;
@@ -285,7 +286,7 @@ int deinit_mcu_message_queue(mcu_message_queue *msg_queue)
 		return -EFAULT;
 	}
 	while (!is_mcu_message_queue_empty(msg_queue)) {
-		drop_one_mcu_message(msg_queue);
+		drop_one_mcu_message_from_queue(msg_queue);
 	}
 	kfree(msg_queue);
 	return 0;
@@ -450,9 +451,9 @@ static irqreturn_t mcu_spi_isr(int irq_no, void *data)
 		return IRQ_HANDLED;
 	}
 	
-
+	
 	dev_dump_hex(buf, MAX_PACKET_LENGTH);
-
+	//TODO: write a unpack func.
 	payload_length = *(uint16_t *)(buf + PAYLOAD_SHIFT - 2);
 	payload_length = max(payload_length, 0);
 	payload_length = min(payload_length, MAX_PAYLOAD_LENGTH);
@@ -466,15 +467,15 @@ static irqreturn_t mcu_spi_isr(int irq_no, void *data)
 	}
 	
 	dev_info(&mcuspi->spid->dev,
-		 "store_one_mcu_message, payload_length:%d, PREAMBLE_LENGTH + SERIAL_NO_LENGTH:%d, PAYLOAD_SHIFT:%d\n", 
+		 "store_one_mcu_message_to_queue, payload_length:%d, PREAMBLE_LENGTH + SERIAL_NO_LENGTH:%d, PAYLOAD_SHIFT:%d\n", 
 		 		payload_length, PREAMBLE_LENGTH + SERIAL_NO_LENGTH, PAYLOAD_SHIFT);
 
 	dev_info(&mcuspi->spid->dev,
-		 "store_one_mcu_message, buf:%ld, payload_desc:%ld, payload:%ld\n", 
+		 "store_one_mcu_message_to_queue, buf:%ld, payload_desc:%ld, payload:%ld\n", 
 		 		buf, buf + PREAMBLE_LENGTH + SERIAL_NO_LENGTH, buf + PAYLOAD_SHIFT);
 
 	printk("mcuspi->recv_msg_queue:%p\n", mcuspi->recv_msg_queue); 
-	status = store_one_mcu_message(mcuspi->recv_msg_queue, 
+	status = store_one_mcu_message_to_queue(mcuspi->recv_msg_queue, 
 			payload_length, buf + PREAMBLE_LENGTH + SERIAL_NO_LENGTH, buf + PAYLOAD_SHIFT);
 	kfree(buf);
 
@@ -918,6 +919,7 @@ static int mcu_spi_probe(struct spi_device *spid)
 
 	ret |= init_mcu_message_queue(&mcuspi->recv_msg_queue);
 	ret |= init_mcu_message(&mcuspi->send_msg);
+	ret |= init_mcu_message(&mcuspi->recv_msg);
 	//test crc32
 	uint32_t crc32_result = ~crc32(0xFFFFFFFF, "UUUUUUUUUUUUUUUU", 15);
 	dev_info(&spid->dev, "The crc32 is: %x\n", crc32_result);
@@ -942,6 +944,7 @@ static int mcu_spi_remove(struct spi_device *spid)
 
 	deinit_mcu_message_queue(mcuspi->recv_msg_queue);
 	deinit_mcu_message(mcuspi->send_msg);
+	deinit_mcu_message(mcuspi->recv_msg);
 	/* Deregister misc device */
 	misc_deregister(&mcuspi->mcu_spi_miscdevice);
 
