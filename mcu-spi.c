@@ -225,6 +225,47 @@ int drop_one_mcu_message(mcu_message_queue *msg_queue)
 	return 0;
 }
 
+int pack_one_mcu_message(mcu_message *mcu_msg, uint8_t *buf)
+{
+	
+	uint16_t payload_length;
+	static uint8_t serial_no = 0;
+	uint32_t checksum;
+
+	printk("pack_one_mcu_message\n");
+
+	// pre_head 0xAA + serial no(1 Byte) + custom data descriptor(64 Bytes) + payload length(2 bytes, count by bytes) + payload(0~1024 Bytes) + CRC32
+	
+	buf[0] = 0xAA;
+	buf[PREAMBLE_LENGTH] = serial_no++;
+
+
+	// use little endian to store payload length 
+	 *(uint16_t *)(buf + PAYLOAD_SHIFT - 2) = mcu_msg->payload_length; //check align!
+	//buf[PAYLOAD_SHIFT - 2] = (uint8_t)(mcu_msg->payload_length & 0xFF);
+	//buf[PAYLOAD_SHIFT - 1] = (uint8_t)((mcu_msg->payload_length >> 8) & 0xFF);
+
+	//for test
+	uint16_t datacount;
+	uint8_t *dataptr = buf + PAYLOAD_SHIFT;
+	uint8_t data = 0;
+	for (datacount = 0 ; datacount < MAX_PAYLOAD_LENGTH; datacount++)
+	{
+			*dataptr++ = data++;
+	}
+	
+	if (mcu_msg->payload_length > 0) {
+		memcpy(buf + PAYLOAD_SHIFT, mcu_msg->payload, mcu_msg->payload_length);
+	}
+	
+	checksum = ~crc32(0xFFFFFFFF, buf, HEAD_LENGTH + mcu_msg->payload_length);
+	*(uint32_t *)(buf + PAYLOAD_SHIFT + mcu_msg->payload_length) = checksum; //check align!
+
+
+
+	return 0;
+}
+
 int init_mcu_message_queue(mcu_message_queue **msg_queue)
 {
 	*msg_queue = kzalloc(sizeof(mcu_message_queue), GFP_KERNEL);
@@ -705,6 +746,8 @@ static ssize_t send_put_msg_store(struct file *filp, struct kobject *kobj,
 	struct mcuspi_dev * mcuspi;
 	struct spi_device * spid;
 	struct mcu_message * mcu_msg;
+	uint8_t * sendbuf = NULL;
+	int ret = 0;
 
 	spid = to_spi_device(kobj_to_dev(kobj->parent));
 	mcuspi = spi_get_drvdata(spid);
@@ -712,9 +755,21 @@ static ssize_t send_put_msg_store(struct file *filp, struct kobject *kobj,
 	if (!mcu_msg) {
 		return -EFAULT; 
 	}
+	sendbuf = kzalloc(MAX_PACKET_LENGTH, GFP_KERNEL);
+	if (!sendbuf) {
+		return -ENOMEM; 
+	}
+	pack_one_mcu_message(mcu_msg, sendbuf);
+	
+	ret |= spi_write(mcuspi->spid, sendbuf, MAX_PACKET_LENGTH); //it use a fixed length(MAX_PACKET_LENGTH) in PHY.
 
+	kfree(sendbuf);
 
-	return count;
+	if (ret) {
+		return -EFAULT;
+	} else {
+		return count;
+	}
 }
 static BIN_ATTR(put_msg, S_IWUSR|S_IWGRP, NULL, send_put_msg_store);
 
@@ -823,7 +878,7 @@ static int mcu_spi_probe(struct spi_device *spid)
 	pr_info("mcu_spi probe\n");
 
 	/* Allocate new structure representing device */
-	mcuspi = devm_kzalloc(&spid->dev, sizeof(struct mcuspi_dev), GFP_KERNEL);
+	mcuspi = devm_kzalloc(&spid->dev, sizeof(struct mcuspi_dev), GFP_KERNEL); //should free automatic.
 	if (!mcuspi) {
 		dev_err(&spid->dev, "mcuspi mem allocation failed!\n");
 		return -ENOMEM;
