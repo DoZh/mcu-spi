@@ -325,9 +325,12 @@ static ssize_t mcuspi_read_file(struct file *file, char __user *userbuf,
                                size_t count, loff_t *ppos)
 {
 	int expval, size;
-	//char buf[1024];
-	char *buf;
+	//char *recvbuf;
 	struct mcuspi_dev * mcuspi;
+	struct mcu_message * mcu_msg = NULL;
+	struct mcu_message_queue * mcu_msg_queue = NULL;
+	int offset = 0;
+	int ret = 0;
 
 
 	/* calc mcuspi addr by miscdevice addr. miscdevice addr fill into
@@ -335,39 +338,28 @@ static ssize_t mcuspi_read_file(struct file *file, char __user *userbuf,
 	mcuspi = container_of(file->private_data, 
 			     struct mcuspi_dev, 
 			     mcu_spi_miscdevice);
-
-	buf = kzalloc(count + 1, GFP_KERNEL);
-	/* read IO expander input to expval */
-	expval = spi_read(mcuspi->spid, buf, count);
-	if (expval < 0)
-		return -EFAULT;
-
-	/* 
-         * converts expval in 2 characters (2bytes) + null value (1byte)
-	 * The values converted are char values (FF) that match with the hex
-	 * int(s32) value of the expval variable.
-	 * if we want to get the int value again, we have to
-	 * do Kstrtoul(). We convert 1 byte int value to
-	 * 2 bytes char values. For instance 255 (1 int byte) = FF (2 char bytes).
-	 */
-	size = sprintf(buf, "%04x", expval);
-
-	/* 
-         * replace NULL by \n. It is not needed to have the char array
-	 * ended with \0 character.
-	 */
-	buf[size] = '\n';
-
-	/* send size+1 to include the \n character */
-	if(*ppos == 0){
-		if(copy_to_user(userbuf, buf, size+1)){
-			pr_info("Failed to return led_value to user space\n");
-			return -EFAULT;
-		}
-		*ppos+=1;
-		return size+1;
+	mcu_msg = mcuspi->send_msg;
+	mcu_msg_queue = mcuspi->recv_msg_queue;
+	if (!mcu_msg || !mcu_msg_queue) {
+		return -EFAULT; 
 	}
-	kfree(buf);
+
+	ret |= load_one_mcu_message_from_queue(mcu_msg_queue, mcu_msg);
+	if (ret <= 0) {
+		return -EFAULT;
+	}
+	//recvbuf = kzalloc(MAX_PAYLOAD_LENGTH, GFP_KERNEL);
+	
+	count = min(mcu_msg->payload_length, count);
+	offset = min(*ppos, mcu_msg->payload_length - count);
+	offset = max(offset, 0);
+
+	if(copy_to_user(userbuf, mcu_msg->payload + offset, count)){
+		pr_info("Failed to copy payload content to user space\n");
+		return -EFAULT;
+	}
+
+	//kfree(recvbuf);
 
 	return 0;
 }
@@ -379,8 +371,7 @@ static ssize_t mcuspi_write_file(struct file *file, const char __user *userbuf,
                                    size_t count, loff_t *ppos)
 {
 	int ret = 0;
-
-	char *buf;
+	int offset = 0;
 	struct mcuspi_dev * mcuspi;
 	struct mcu_message * mcu_msg;
 	uint8_t * sendbuf = NULL;
@@ -400,7 +391,9 @@ static ssize_t mcuspi_write_file(struct file *file, const char __user *userbuf,
 		return -EFAULT; 
 	}
 	mcu_msg->payload_length = max(count, 0);
-	mcu_msg->payload_length  = min(count, MAX_PAYLOAD_LENGTH);
+	mcu_msg->payload_length = min(count, MAX_PAYLOAD_LENGTH);
+	offset = min(*ppos, MAX_PAYLOAD_LENGTH - mcu_msg->payload_length);
+	offset = max(offset, 0);
 	if (mcu_msg->payload_length > 0) {
 		if(copy_from_user(mcu_msg->payload, userbuf, mcu_msg->payload_length)) {
 			dev_err(&mcuspi->spid->dev, "Bad copied value\n");
@@ -505,13 +498,11 @@ static ssize_t recv_payload_show(struct file *filp, struct kobject *kobj,
 {	
 	struct mcuspi_dev * mcuspi;
 	struct spi_device * spid;
-	struct mcu_message_queue * msg_queue;
 	struct mcu_message * mcu_msg;
 
 	spid = to_spi_device(kobj_to_dev(kobj->parent));
 	mcuspi = spi_get_drvdata(spid);
-	msg_queue = mcuspi->recv_msg_queue;
-	mcu_msg = msg_queue->mcu_msg[msg_queue->read_msg_idx];
+	mcu_msg = mcuspi->recv_msg;
 	if (!mcu_msg) {
 		return -EFAULT; 
 	}
@@ -530,19 +521,17 @@ static ssize_t recv_payload_len_show(struct file *filp, struct kobject *kobj,
 {
 	struct mcuspi_dev * mcuspi;
 	struct spi_device * spid;
-	struct mcu_message_queue * msg_queue;
 	struct mcu_message * mcu_msg;
 
 	spid = to_spi_device(kobj_to_dev(kobj->parent));
 	mcuspi = spi_get_drvdata(spid);
-	msg_queue = mcuspi->recv_msg_queue;
-	mcu_msg = msg_queue->mcu_msg[msg_queue->read_msg_idx];
+	mcu_msg = mcuspi->recv_msg;
 	if (!mcu_msg) {
 		return -EFAULT; 
 	}
 	dev_info(&mcuspi->spid->dev,
-		 "recv_payload_len_show, spid:%p, mcuspi:%p, msg_queue:%p, payload_len:%d\n", 
-	 		spid, mcuspi, msg_queue, mcu_msg->payload_length);
+		 "recv_payload_len_show, spid:%p, mcuspi:%p, payload_len:%d\n", 
+	 		spid, mcuspi, mcu_msg->payload_length);
 	count = min(count, sizeof(mcu_msg->payload_length));
 	off = min(off, sizeof(mcu_msg->payload_length) - count);
 	memcpy(buf, &(mcu_msg->payload_length) + off, count);
@@ -555,13 +544,11 @@ static ssize_t recv_payload_desc_show(struct file *filp, struct kobject *kobj,
 {
 	struct mcuspi_dev * mcuspi;
 	struct spi_device * spid;
-	struct mcu_message_queue * msg_queue;
 	struct mcu_message * mcu_msg;
 
 	spid = to_spi_device(kobj_to_dev(kobj->parent));
 	mcuspi = spi_get_drvdata(spid);
-	msg_queue = mcuspi->recv_msg_queue;
-	mcu_msg = msg_queue->mcu_msg[msg_queue->read_msg_idx];
+	mcu_msg = mcuspi->recv_msg;
 	if (!mcu_msg) {
 		return -EFAULT; 
 	}
@@ -599,41 +586,16 @@ static ssize_t recv_get_msg_store(struct file *filp, struct kobject *kobj,
 	struct mcuspi_dev * mcuspi;
 	struct spi_device * spid;
 	struct mcu_message_queue * msg_queue;
-	struct mcu_message * prev_mcu_msg;
+	//struct mcu_message * prev_mcu_msg;
+	struct mcu_message * mcu_msg;
 
 	spid = to_spi_device(kobj_to_dev(kobj->parent));
 	mcuspi = spi_get_drvdata(spid);
 	msg_queue = mcuspi->recv_msg_queue;
+	mcu_msg = mcuspi->recv_msg;
 
-	//clean up memory of previous msg
-	prev_mcu_msg = msg_queue->mcu_msg[msg_queue->read_msg_idx];
-	dev_info(&mcuspi->spid->dev,
-		 "recv_get_msg_store, spid:%p, mcuspi:%p, msg_queue:%p, prev_mcu_msg:%p, read_msg_idx:%d\n", 
-	 		spid, mcuspi, msg_queue, prev_mcu_msg, msg_queue->read_msg_idx);
-	if (prev_mcu_msg) {
-		if (prev_mcu_msg->payload_length > 0 && prev_mcu_msg->payload) {
-			//memcpy(payload, mcu_msg->payload, mcu_msg->payload_length);
-			kfree (prev_mcu_msg->payload);
-			prev_mcu_msg->payload = NULL;
-		}
-		//memcpy(payload_desc, mcu_msg->payload_desc, PAYLOAD_DESC_LENGTH);
-		//*payload_length = mcu_msg->payload_length;
-		kfree(prev_mcu_msg);
-		msg_queue->mcu_msg[msg_queue->read_msg_idx] = NULL;
-	}
+	load_one_mcu_message_from_queue(msg_queue, mcu_msg);
 
-
-	if (msg_queue->msg_count <= 0) {
-		return -EAGAIN;
-	}
-	(msg_queue->msg_count)--;
-	(msg_queue->read_msg_idx)++;
-	if ((msg_queue->read_msg_idx) >= MAX_BUFFERED_MSG) {
-		msg_queue->read_msg_idx = 0;
-	}
-	/*
-	
-	*/
 	return count;
 }
 static BIN_ATTR(get_msg, S_IWUSR|S_IWGRP, NULL, recv_get_msg_store);
