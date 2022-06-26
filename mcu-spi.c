@@ -41,6 +41,8 @@ struct mcuspi_dev {
 	struct miscdevice mcu_spi_miscdevice;
 	struct mcu_message_queue * recv_msg_queue;
 	struct mcu_message * send_msg;
+	struct kobject *send_subdir;
+	struct kobject *recv_subdir;
 	char name[8]; /* mcuspiX */
 };
 
@@ -634,10 +636,7 @@ static ssize_t send_payload_store(struct file *filp, struct kobject *kobj,
 	struct spi_device * spid;
 	struct mcu_message * mcu_msg;
 
-	printk("send_payload_store init\n");
-	//return count;
 	spid = to_spi_device(kobj_to_dev(kobj->parent));
-	printk( "send_payload_store after to_spi_device\n");
 	mcuspi = spi_get_drvdata(spid);
 	mcu_msg = mcuspi->send_msg;
 	if (!mcu_msg) {
@@ -750,16 +749,25 @@ static int mcu_spi_init_sysfs(struct spi_device *spid)
 {
 	int ret = 0;
 	int i = 0;
-	struct kobject *send_subdir = kobject_create_and_add(send_msg_attr_group.name,
+	struct mcuspi_dev * mcuspi = spi_get_drvdata(spid);
+	
+	mcuspi->send_subdir = kobject_create_and_add(send_msg_attr_group.name,
                                              &spid->dev.kobj);
-
-	for (i = 0; send_msg_attributes[i]; i++) {
-		ret |= sysfs_create_bin_file(send_subdir, send_msg_attributes[i]);
+	if (!mcuspi->send_subdir) {
+		dev_err(&spid->dev, "create send_subdir failed\n");
+		return -EFAULT;
 	}
-	struct kobject *recv_subdir = kobject_create_and_add(recv_msg_attr_group.name,
+	for (i = 0; send_msg_attributes[i]; i++) {
+		ret |= sysfs_create_bin_file(mcuspi->send_subdir, send_msg_attributes[i]);
+	}
+	mcuspi->recv_subdir = kobject_create_and_add(recv_msg_attr_group.name,
                                              &spid->dev.kobj);
+	if (!mcuspi->recv_subdir) {
+		dev_err(&spid->dev, "create recv_subdir failed\n");
+		return -EFAULT;
+	}
 	for (i = 0; recv_msg_attributes[i]; i++) {
-		ret |= sysfs_create_bin_file(recv_subdir, recv_msg_attributes[i]);
+		ret |= sysfs_create_bin_file(mcuspi->recv_subdir, recv_msg_attributes[i]);
 	}
 	return ret;
 }
@@ -768,23 +776,36 @@ static int mcu_spi_init_sysfs(struct spi_device *spid)
 static int mcu_spi_deinit_sysfs(struct spi_device *spid) 
 {
 	int i = 0;
+	int ret = 0;
+	struct mcuspi_dev * mcuspi = spi_get_drvdata(spid);
+	
+	
 	/* Find the kobj from the path and parent kset */
-	struct kobject *send_subdir = kset_find_obj(spid->dev.kobj.kset, send_msg_attr_group.name);
-	struct kobject *recv_subdir = kset_find_obj(spid->dev.kobj.kset, recv_msg_attr_group.name);
+	//seems kset_find_obj cannot be used with this scenario.
+	//struct kobject *send_subdir = kset_find_obj(spid->dev.kobj.kset, send_msg_attr_group.name);
+	//struct kobject *recv_subdir = kset_find_obj(spid->dev.kobj.kset, recv_msg_attr_group.name);
+
 	/* check kobj is not null etc. */
-	if (send_subdir) {
+	if (mcuspi->send_subdir) {
 		for (i = 0; send_msg_attributes[i]; i++) {
-			sysfs_remove_bin_file(send_subdir, send_msg_attributes[i]);
+			sysfs_remove_bin_file(mcuspi->send_subdir, send_msg_attributes[i]);
 		}
 		/* Remove the sysfs entry */
-		kobject_del(send_subdir);
+		kobject_put(mcuspi->send_subdir);
+	} else {
+		dev_err(&spid->dev, "mcuspi send_subdir remove failed!\n");
+		ret |= -EFAULT;
 	}
-	if (recv_subdir) {
+	if (mcuspi->recv_subdir) {
 		for (i = 0; send_msg_attributes[i]; i++) {
-			sysfs_remove_bin_file(recv_subdir, recv_msg_attributes[i]);
+			sysfs_remove_bin_file(mcuspi->recv_subdir, recv_msg_attributes[i]);
 		}
-		kobject_del(recv_subdir);
+		kobject_put(mcuspi->recv_subdir);
+	} else {
+		dev_err(&spid->dev, "mcuspi recv_subdir remove failed!\n");
+		ret |= -EFAULT;
 	}
+	return ret;
 }
 
 static int mcu_spi_probe(struct spi_device *spid)
