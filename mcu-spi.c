@@ -340,12 +340,20 @@ static ssize_t mcuspi_read_file(struct file *file, char __user *userbuf,
 			     mcu_spi_miscdevice);
 	mcu_msg = mcuspi->send_msg;
 	mcu_msg_queue = mcuspi->recv_msg_queue;
+	
+	dev_info(&mcuspi->spid->dev, 
+		 "mcuspi_read_file entered on %s\n", mcuspi->name);
+
 	if (!mcu_msg || !mcu_msg_queue) {
+		dev_info(&mcuspi->spid->dev, 
+		    "mcu_msg: %08x, mcu_msg_queue: %08x\n", mcu_msg, mcu_msg_queue);
 		return -EFAULT; 
 	}
 
 	ret |= load_one_mcu_message_from_queue(mcu_msg_queue, mcu_msg);
-	if (ret <= 0) {
+	if (ret < 0) {
+		dev_info(&mcuspi->spid->dev, 
+			"load_one_mcu_message_from_queue Failed with %d\n", ret);
 		return -EFAULT;
 	}
 	//recvbuf = kzalloc(MAX_PAYLOAD_LENGTH, GFP_KERNEL);
@@ -354,14 +362,22 @@ static ssize_t mcuspi_read_file(struct file *file, char __user *userbuf,
 	offset = min(*ppos, mcu_msg->payload_length - count);
 	offset = max(offset, 0);
 
-	if(copy_to_user(userbuf, mcu_msg->payload + offset, count)){
+	
+	dev_info(&mcuspi->spid->dev, 
+		 "count:%d, offset: %d, buf_ptr: %08x\n", count, offset, mcu_msg->payload + offset);
+
+	if(copy_to_user(userbuf, mcu_msg->payload + offset, count)) {
 		pr_info("Failed to copy payload content to user space\n");
 		return -EFAULT;
 	}
 
+	dev_info(&mcuspi->spid->dev, 
+		 "mcuspi_read_file exited on %s\n", mcuspi->name);
+
+
 	//kfree(recvbuf);
 
-	return 0;
+	return count;
 }
 
 
