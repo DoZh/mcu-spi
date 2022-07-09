@@ -47,6 +47,7 @@ struct mcuspi_dev {
 	struct kobject *recv_subdir;
 	struct mutex bus_lock;
 	bool intr_recv_not_comp;
+	uint8_t * unexpected_recv_data_when_send;  
 	char name[8]; /* mcuspiX */
 };
 
@@ -94,24 +95,57 @@ void dev_dump_hex(const void* data, size_t size) {
 }
 
 static inline int
+spi_read_and_write(struct spi_device *spi, void *rxbuf, void *txbuf, size_t len)
+{
+	struct spi_transfer	t = {
+			.rx_buf		= rxbuf,
+			.tx_buf		= txbuf,
+			.len		= len,
+		};
+
+	return spi_sync_transfer(spi, &t, 1);
+}
+
+static inline int
 data_write_to_bus(struct mcuspi_dev *mcuspi, const void *buf, size_t len)
 {
 	int ret = 0;
+	/*
 	if (mcuspi->intr_recv_not_comp) {
 		usleep_range(50, 100);
 		while (mcuspi->intr_recv_not_comp) {
-			dev_info(&mcuspi->spid->dev, 
-			"%s: wait isr comp\n", mcuspi->name);
+			//dev_info(&mcuspi->spid->dev, 
+			//"%s: wait isr comp\n", mcuspi->name);
 			//msleep_interruptible(10);
 			usleep_range(1000, 2000);
 		}
 	}
+	*/
 	
 	
 	mutex_lock_interruptible(&mcuspi->bus_lock);
-	ret = spi_write(mcuspi->spid, buf, len);
-	mutex_unlock(&mcuspi->bus_lock);
-	return ret;
+	while (mcuspi->intr_recv_not_comp) {
+		mutex_unlock(&mcuspi->bus_lock);
+		usleep_range(50, 100);
+		mutex_lock_interruptible(&mcuspi->bus_lock);
+	}
+	while (1) {
+		uint8_t *recvbuf = kzalloc(len, GFP_KERNEL);
+		ret = spi_read_and_write(mcuspi->spid, recvbuf, buf, len);
+		if (*recvbuf == 0xAA) {
+			mcuspi->unexpected_recv_data_when_send == recvbuf;
+			while (mcuspi->intr_recv_not_comp) {
+				mutex_unlock(&mcuspi->bus_lock);
+				usleep_range(50, 100);
+				mutex_lock_interruptible(&mcuspi->bus_lock);
+			}
+		} else {
+			kfree(recvbuf);
+			mutex_unlock(&mcuspi->bus_lock);
+			return ret;
+		}
+	}
+	
 }
 
 static inline int
@@ -119,7 +153,13 @@ data_read_from_bus(struct mcuspi_dev *mcuspi, const void *buf, size_t len)
 {
 	int ret = 0;
 	mutex_lock_interruptible(&mcuspi->bus_lock);
-	ret = spi_read(mcuspi->spid, buf, len);
+	if (mcuspi->unexpected_recv_data_when_send == NULL) {
+		ret = spi_read(mcuspi->spid, buf, len);
+	} else {
+		memcpy(buf, mcuspi->unexpected_recv_data_when_send, len);
+		kfree(mcuspi->unexpected_recv_data_when_send);
+		mcuspi->unexpected_recv_data_when_send = NULL;
+	}
 	mutex_unlock(&mcuspi->bus_lock);
 	return ret;
 }
@@ -143,7 +183,6 @@ int store_one_mcu_message_to_queue(mcu_message_queue *msg_queue,
 			uint16_t payload_length, uint8_t *payload_desc, uint8_t *payload)
 {
 	//TODO: rewrite it use mcu_message instead of seperated payload_xxx
-	printk("store_one_mcu_message_to_queue\n");
 	if (msg_queue->msg_count >= MAX_BUFFERED_MSG) {
 		return -ENOSPC;
 	}
@@ -267,8 +306,6 @@ int pack_one_mcu_message(mcu_message *mcu_msg, uint8_t *buf)
 	static uint8_t serial_no = 0;
 	uint32_t checksum;
 
-	printk("pack_one_mcu_message\n");
-
 	// pre_head 0xAA + serial no(1 Byte) + custom data descriptor(64 Bytes) + payload length(2 bytes, count by bytes) + payload(0~1024 Bytes) + CRC32
 	
 	buf[0] = 0xAA;
@@ -310,7 +347,6 @@ int init_mcu_message_queue(mcu_message_queue **msg_queue)
 	(*msg_queue)->read_msg_idx = MAX_BUFFERED_MSG - 1;
 	(*msg_queue)->write_msg_idx = 0;
 	(*msg_queue)->msg_count = 0;
-	printk("init_mcu_message_queue:%08x\n", *msg_queue);
 	return 0;
 }
 
@@ -338,8 +374,6 @@ int init_mcu_message(mcu_message **msg)
 		kfree(msg);
 		return -ENOMEM;
 	}
-
-	printk("init_mcu_message:%08x\n", *msg);
 	return 0;
 }
 
@@ -374,9 +408,10 @@ static ssize_t mcuspi_read_file(struct file *file, char __user *userbuf,
 			     mcu_spi_miscdevice);
 	mcu_msg = mcuspi->send_msg;
 	mcu_msg_queue = mcuspi->recv_msg_queue;
-	
+	/*
 	dev_info(&mcuspi->spid->dev, 
 		 "mcuspi_read_file entered on %s\n", mcuspi->name);
+		 */
 
 	if (!mcu_msg || !mcu_msg_queue) {
 		dev_info(&mcuspi->spid->dev, 
@@ -396,18 +431,18 @@ static ssize_t mcuspi_read_file(struct file *file, char __user *userbuf,
 	offset = min(*ppos, mcu_msg->payload_length - count);
 	offset = max(offset, 0);
 
-	
+	/*
 	dev_info(&mcuspi->spid->dev, 
 		 "count:%d, offset: %d, buf_ptr: %08x\n", count, offset, mcu_msg->payload + offset);
-
+	*/
 	if(copy_to_user(userbuf, mcu_msg->payload + offset, count)) {
 		pr_info("Failed to copy payload content to user space\n");
 		return -EFAULT;
 	}
-
+	/*
 	dev_info(&mcuspi->spid->dev, 
 		 "mcuspi_read_file exited on %s\n", mcuspi->name);
-
+	*/
 
 	//kfree(recvbuf);
 
@@ -429,13 +464,13 @@ static ssize_t mcuspi_write_file(struct file *file, const char __user *userbuf,
 	mcuspi = container_of(file->private_data,
 			     struct mcuspi_dev, 
 			     mcu_spi_miscdevice);
-
+/*
 	dev_info(&mcuspi->spid->dev, 
 		 "mcuspi_write_file entered on %s\n", mcuspi->name);
 
 	dev_info(&mcuspi->spid->dev,
 		 "we have written %zu characters to file\n", count); 
-
+*/
 	mcu_msg = mcuspi->send_msg;
 	if (!mcu_msg) {
 		return -EFAULT; 
@@ -463,12 +498,14 @@ static ssize_t mcuspi_write_file(struct file *file, const char __user *userbuf,
 
 	if (ret < 0) 
 		dev_err(&mcuspi->spid->dev, "the device is not found, ERRNO: %d\n", ret);
+		/*
 	else
 		dev_info(&mcuspi->spid->dev, "we have written %zu characters to spi bus.\n", count); 
-
+		*/
+/*
 	dev_info(&mcuspi->spid->dev, 
 		 "mcuspi_write_file exited on %s\n", mcuspi->name);
-
+*/
 	return count;
 }
 
@@ -489,7 +526,7 @@ static irqreturn_t mcu_spi_isr(int irq_no, void *data)
 	int payload_length = 0;
 	uint32_t checksum;
 
-	dev_info(&mcuspi->spid->dev, "interrupt received. device: %s\n", mcuspi->name);
+	//dev_info(&mcuspi->spid->dev, "interrupt received. device: %s\n", mcuspi->name);
 	buf = kzalloc(MAX_PACKET_LENGTH, GFP_KERNEL);
 	if (!buf) {
 		dev_info(&mcuspi->spid->dev, "allocate memory fail in isr. device: %s\n", mcuspi->name);
@@ -519,7 +556,7 @@ static irqreturn_t mcu_spi_isr(int irq_no, void *data)
 		//mcuspi->intr_recv_not_comp = false;
 		return IRQ_HANDLED;
 	}
-	
+	/*
 	dev_info(&mcuspi->spid->dev,
 		 "store_one_mcu_message_to_queue, payload_length:%d, PREAMBLE_LENGTH + SERIAL_NO_LENGTH:%d, PAYLOAD_SHIFT:%d\n", 
 		 		payload_length, PREAMBLE_LENGTH + SERIAL_NO_LENGTH, PAYLOAD_SHIFT);
@@ -528,7 +565,7 @@ static irqreturn_t mcu_spi_isr(int irq_no, void *data)
 		 "store_one_mcu_message_to_queue, buf:%ld, payload_desc:%ld, payload:%ld\n", 
 		 		buf, buf + PREAMBLE_LENGTH + SERIAL_NO_LENGTH, buf + PAYLOAD_SHIFT);
 
-	printk("mcuspi->recv_msg_queue:%p\n", mcuspi->recv_msg_queue); 
+	*/
 	status = store_one_mcu_message_to_queue(mcuspi->recv_msg_queue, 
 			payload_length, buf + PREAMBLE_LENGTH + SERIAL_NO_LENGTH, buf + PAYLOAD_SHIFT);
 	kfree(buf);
@@ -536,21 +573,7 @@ static irqreturn_t mcu_spi_isr(int irq_no, void *data)
 	if (status) {
 		dev_info(&mcuspi->spid->dev, "store msg fail in isr. errno:%d device: %s\n", status, mcuspi->name);
 	}
-/*
-	val = gpiod_get_value(priv->gpio);
-	dev_info(priv->dev, "Button state: 0x%08X\n", val);
 
-	if (val == 1)
-		hello_keys_buf[buf_wr++] = 'P'; 
-	else
-		hello_keys_buf[buf_wr++] = 'R';
-
-	if (buf_wr >= MAX_KEY_STATES)
-		buf_wr = 0;
-
-	// Wake up the process 
-	wake_up_interruptible(&priv->wq_data_available);
-*/
 	
 	return IRQ_HANDLED;
 }
@@ -591,9 +614,11 @@ static ssize_t recv_payload_len_show(struct file *filp, struct kobject *kobj,
 	if (!mcu_msg) {
 		return -EFAULT; 
 	}
+	/*
 	dev_info(&mcuspi->spid->dev,
 		 "recv_payload_len_show, spid:%p, mcuspi:%p, payload_len:%d\n", 
 	 		spid, mcuspi, mcu_msg->payload_length);
+			*/
 	count = min(count, sizeof(mcu_msg->payload_length));
 	off = min(off, sizeof(mcu_msg->payload_length) - count);
 	memcpy(buf, &(mcu_msg->payload_length) + off, count);
@@ -632,9 +657,11 @@ static ssize_t recv_remain_msg_count_show(struct file *filp, struct kobject *kob
 	mcuspi = spi_get_drvdata(spid);
 	msg_queue = mcuspi->recv_msg_queue;
 
+	/*
 	dev_info(&mcuspi->spid->dev,
 		 "recv_remain_msg_count_show, spid:%p, mcuspi:%p, msg_queue:%p, msg_cnt:%d\n", 
 	 		spid, mcuspi, msg_queue, msg_queue->msg_count);
+	*/
 	count = min(count, sizeof(msg_queue->msg_count));
 	off = min(off, sizeof(msg_queue->msg_count) - count);
 	memcpy(buf, &(msg_queue->msg_count) + off, count);
@@ -883,8 +910,6 @@ static int mcu_spi_probe(struct spi_device *spid)
 	struct gpio_desc *interrupt_gpio;
 	int irq_no;
 
-	pr_info("mcu_spi probe\n");
-
 	/* Allocate new structure representing device */
 	mcuspi = devm_kzalloc(&spid->dev, sizeof(struct mcuspi_dev), GFP_KERNEL); //should free automatic.
 	if (!mcuspi) {
@@ -898,8 +923,9 @@ static int mcu_spi_probe(struct spi_device *spid)
 	mcuspi->spid = spid;
 	/* init mutex lock */
 	mutex_init(&mcuspi->bus_lock);
-	/* init interrupt in progress flag */
+	/* init interrupt in progress flag and unexpected data ptr */
 	mcuspi->intr_recv_not_comp = false;
+	mcuspi->unexpected_recv_data_when_send = NULL;
 	/* Initialize the misc device, mcuspi incremented after each probe call */
 	sprintf(mcuspi->name, "mcuspi%01d", counter++); 
 	dev_info(&spid->dev, 
