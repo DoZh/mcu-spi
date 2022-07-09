@@ -10,6 +10,7 @@
 #include <linux/uaccess.h>
 #include <linux/interrupt.h>
 #include <linux/crc32.h>
+#include <linux/delay.h>
 
 
 #define PREAMBLE_LENGTH 1
@@ -44,6 +45,8 @@ struct mcuspi_dev {
 	struct mcu_message * recv_msg;  /* store the recv_msg being processed by userspace*/
 	struct kobject *send_subdir;
 	struct kobject *recv_subdir;
+	struct mutex bus_lock;
+	bool intr_recv_not_comp;
 	char name[8]; /* mcuspiX */
 };
 
@@ -88,6 +91,29 @@ void dev_dump_hex(const void* data, size_t size) {
 			}
 		}
 	}
+}
+
+static inline int
+data_write_to_bus(struct mcuspi_dev *mcuspi, const void *buf, size_t len)
+{
+	int ret = 0;
+	while (mcuspi->intr_recv_not_comp) {
+		msleep_interruptible(1);
+	}
+	mutex_lock_interruptible(&mcuspi->bus_lock);
+	ret = spi_write(mcuspi->spid, buf, len);
+	mutex_unlock(&mcuspi->bus_lock);
+	return ret;
+}
+
+static inline int
+data_read_from_bus(struct mcuspi_dev *mcuspi, const void *buf, size_t len)
+{
+	int ret = 0;
+	mutex_lock_interruptible(&mcuspi->bus_lock);
+	ret = spi_read(mcuspi->spid, buf, len);
+	mutex_unlock(&mcuspi->bus_lock);
+	return ret;
 }
 
 bool is_mcu_message_queue_full(mcu_message_queue *msg_queue) 
@@ -423,7 +449,7 @@ static ssize_t mcuspi_write_file(struct file *file, const char __user *userbuf,
 	}
 	pack_one_mcu_message(mcu_msg, sendbuf);
 	
-	ret |= spi_write(mcuspi->spid, sendbuf, MAX_PACKET_LENGTH); //it use a fixed length(MAX_PACKET_LENGTH) in PHY.
+	ret |= data_write_to_bus(mcuspi, sendbuf, MAX_PACKET_LENGTH); //it use a fixed length(MAX_PACKET_LENGTH) in PHY.
 
 	kfree(sendbuf);
 
@@ -436,6 +462,14 @@ static ssize_t mcuspi_write_file(struct file *file, const char __user *userbuf,
 		 "mcuspi_write_file exited on %s\n", mcuspi->name);
 
 	return count;
+}
+
+static irqreturn_t mcu_spi_set_intr_busy(int irq_no, void *data)
+{
+
+	struct mcuspi_dev * mcuspi = data;
+	mcuspi->intr_recv_not_comp = true;
+	return IRQ_WAKE_THREAD;
 }
 
 static irqreturn_t mcu_spi_isr(int irq_no, void *data)
@@ -451,12 +485,14 @@ static irqreturn_t mcu_spi_isr(int irq_no, void *data)
 	buf = kzalloc(MAX_PACKET_LENGTH, GFP_KERNEL);
 	if (!buf) {
 		dev_info(&mcuspi->spid->dev, "allocate memory fail in isr. device: %s\n", mcuspi->name);
+		mcuspi->intr_recv_not_comp = false;
 		return IRQ_HANDLED;
 	}
-	status = spi_read(mcuspi->spid, buf, MAX_PACKET_LENGTH); 
+	status = data_read_from_bus(mcuspi, buf, MAX_PACKET_LENGTH); 
 	if (status) {
 		dev_info(&mcuspi->spid->dev, "spi read fail in isr. device: %s\n", mcuspi->name);
 		kfree(buf);
+		mcuspi->intr_recv_not_comp = false;
 		return IRQ_HANDLED;
 	}
 	
@@ -472,6 +508,7 @@ static irqreturn_t mcu_spi_isr(int irq_no, void *data)
 		dev_info(&mcuspi->spid->dev, "crc32 checksum mismatch in isr. device: %s\nchecksum = %08x, msg_checksum = %08x\n", 
 					mcuspi->name, checksum, *(uint32_t *)(buf + PAYLOAD_SHIFT + payload_length));
 		kfree(buf);
+		mcuspi->intr_recv_not_comp = false;
 		return IRQ_HANDLED;
 	}
 	
@@ -506,6 +543,7 @@ static irqreturn_t mcu_spi_isr(int irq_no, void *data)
 	// Wake up the process 
 	wake_up_interruptible(&priv->wq_data_available);
 */
+	mcuspi->intr_recv_not_comp = false;
 	return IRQ_HANDLED;
 }
 
@@ -723,7 +761,7 @@ static ssize_t send_put_msg_store(struct file *filp, struct kobject *kobj,
 	}
 	pack_one_mcu_message(mcu_msg, sendbuf);
 	
-	ret |= spi_write(mcuspi->spid, sendbuf, MAX_PACKET_LENGTH); //it use a fixed length(MAX_PACKET_LENGTH) in PHY.
+	ret |= data_write_to_bus(mcuspi, sendbuf, MAX_PACKET_LENGTH); //it use a fixed length(MAX_PACKET_LENGTH) in PHY.
 
 	kfree(sendbuf);
 
@@ -850,7 +888,10 @@ static int mcu_spi_probe(struct spi_device *spid)
 
 	/* Store pointer to SPI device/client */
 	mcuspi->spid = spid;
-
+	/* init mutex lock */
+	mutex_init(&mcuspi->bus_lock);
+	/* init interrupt in progress flag */
+	mcuspi->intr_recv_not_comp = false;
 	/* Initialize the misc device, mcuspi incremented after each probe call */
 	sprintf(mcuspi->name, "mcuspi%01d", counter++); 
 	dev_info(&spid->dev, 
@@ -877,7 +918,7 @@ static int mcu_spi_probe(struct spi_device *spid)
 	dev_info(&spid->dev, "The IRQ number is: %d\n", irq_no);
 
 	/* Request threaded interrupt */
-	err = devm_request_threaded_irq(&spid->dev, irq_no, NULL,
+	err = devm_request_threaded_irq(&spid->dev, irq_no, mcu_spi_set_intr_busy,
 			mcu_spi_isr, IRQF_TRIGGER_FALLING | IRQF_ONESHOT, mcuspi->name, mcuspi);
 	if (err)
 		return ERR_PTR(err);
@@ -893,7 +934,7 @@ static int mcu_spi_probe(struct spi_device *spid)
 	//sysfs file may under /sys/class/spi_master/spix/spix.y/ZZZ
 
 	/* Register misc device */
-	ret |=  misc_register(&mcuspi->mcu_spi_miscdevice);
+	ret |= misc_register(&mcuspi->mcu_spi_miscdevice);
 
 	ret |= init_mcu_message_queue(&mcuspi->recv_msg_queue);
 	ret |= init_mcu_message(&mcuspi->send_msg);
