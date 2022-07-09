@@ -97,9 +97,17 @@ static inline int
 data_write_to_bus(struct mcuspi_dev *mcuspi, const void *buf, size_t len)
 {
 	int ret = 0;
-	while (mcuspi->intr_recv_not_comp) {
-		msleep_interruptible(1);
+	if (mcuspi->intr_recv_not_comp) {
+		usleep_range(50, 100);
+		while (mcuspi->intr_recv_not_comp) {
+			dev_info(&mcuspi->spid->dev, 
+			"%s: wait isr comp\n", mcuspi->name);
+			//msleep_interruptible(10);
+			usleep_range(1000, 2000);
+		}
 	}
+	
+	
 	mutex_lock_interruptible(&mcuspi->bus_lock);
 	ret = spi_write(mcuspi->spid, buf, len);
 	mutex_unlock(&mcuspi->bus_lock);
@@ -140,23 +148,23 @@ int store_one_mcu_message_to_queue(mcu_message_queue *msg_queue,
 		return -ENOSPC;
 	}
 
-	mcu_message * mcu_msg = kzalloc(sizeof(mcu_message), GFP_KERNEL);
-	if (!mcu_msg) {
+	mcu_message * mcu_msg_in_queue = kzalloc(sizeof(mcu_message), GFP_KERNEL);
+	if (!mcu_msg_in_queue) {
 		return -ENOMEM;
 	}
 	
-	memcpy(mcu_msg->payload_desc, payload_desc, PAYLOAD_DESC_LENGTH);
-	mcu_msg->payload = NULL;
-	mcu_msg->payload_length = payload_length;
+	memcpy(mcu_msg_in_queue->payload_desc, payload_desc, PAYLOAD_DESC_LENGTH);
+	mcu_msg_in_queue->payload = NULL;
+	mcu_msg_in_queue->payload_length = payload_length;
 	if (payload_length > 0) {
-		mcu_msg->payload = kzalloc(payload_length, GFP_KERNEL);
-		if (!mcu_msg->payload) {
-			kfree(mcu_msg);
+		mcu_msg_in_queue->payload = kzalloc(payload_length, GFP_KERNEL);
+		if (!mcu_msg_in_queue->payload) {
+			kfree(mcu_msg_in_queue);
 			return -ENOMEM;
 		}
-		memcpy(mcu_msg->payload, payload, payload_length);
+		memcpy(mcu_msg_in_queue->payload, payload, payload_length);
 	}
-	msg_queue->mcu_msg[msg_queue->write_msg_idx] = mcu_msg;
+	msg_queue->mcu_msg[msg_queue->write_msg_idx] = mcu_msg_in_queue;
 	(msg_queue->write_msg_idx)++;
 	if ((msg_queue->write_msg_idx) >= MAX_BUFFERED_MSG) {
 		msg_queue->write_msg_idx = 0;
@@ -495,20 +503,20 @@ static irqreturn_t mcu_spi_isr(int irq_no, void *data)
 		mcuspi->intr_recv_not_comp = false;
 		return IRQ_HANDLED;
 	}
+	mcuspi->intr_recv_not_comp = false;
 	
-	
-	dev_dump_hex(buf, MAX_PACKET_LENGTH);
+	//dev_dump_hex(buf, MAX_PACKET_LENGTH);
 	//TODO: write a unpack func.
 	payload_length = *(uint16_t *)(buf + PAYLOAD_SHIFT - 2);
 	payload_length = max(payload_length, 0);
 	payload_length = min(payload_length, MAX_PAYLOAD_LENGTH);
 	checksum = ~crc32(0xFFFFFFFF, buf, HEAD_LENGTH + payload_length);
-	dev_info(&mcuspi->spid->dev, "crc32 checksum = %08x, msg_checksum = %08x\n", checksum, *(uint32_t *)(buf + PAYLOAD_SHIFT + payload_length));
+	//dev_info(&mcuspi->spid->dev, "crc32 checksum = %08x, msg_checksum = %08x\n", checksum, *(uint32_t *)(buf + PAYLOAD_SHIFT + payload_length));
 	if (checksum != *(uint32_t *)(buf + PAYLOAD_SHIFT + payload_length)) {
 		dev_info(&mcuspi->spid->dev, "crc32 checksum mismatch in isr. device: %s\nchecksum = %08x, msg_checksum = %08x\n", 
 					mcuspi->name, checksum, *(uint32_t *)(buf + PAYLOAD_SHIFT + payload_length));
 		kfree(buf);
-		mcuspi->intr_recv_not_comp = false;
+		//mcuspi->intr_recv_not_comp = false;
 		return IRQ_HANDLED;
 	}
 	
@@ -543,7 +551,7 @@ static irqreturn_t mcu_spi_isr(int irq_no, void *data)
 	// Wake up the process 
 	wake_up_interruptible(&priv->wq_data_available);
 */
-	mcuspi->intr_recv_not_comp = false;
+	
 	return IRQ_HANDLED;
 }
 
